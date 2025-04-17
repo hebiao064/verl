@@ -23,7 +23,8 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
-from verl.trainer.ppo.core_algos import compute_policy_loss, kl_penalty, agg_loss, compute_online_dpo_loss, get_batch_logps
+from verl.trainer.ppo.core_algos import compute_policy_loss, kl_penalty, agg_loss
+from recipe.spin.core_algos import compute_online_dpo_loss, get_batch_logps
 from verl.workers.actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
@@ -550,7 +551,7 @@ class DataParallelPPOActor(BasePPOActor):
             append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
         return metrics
-    s
+    
     def update_actor_dpo(self, data: DataProto):
         """Performs the Online DPO update step with improved reference logprob handling."""
         if self.actor_optimizer is None:

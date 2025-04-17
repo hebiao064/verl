@@ -13,12 +13,12 @@ export TOKENIZERS_PARALLELISM=false
 export NCCL_DEBUG=WARN
 export WANDB_API_KEY=25c95cfb8dfe322ae6d944a369d2ae63b65d9ece
 
-MODEL_NAME="Qwen/Qwen2-1.5B-Instruct"
+MODEL_NAME="Qwen/Qwen2-7B-Instruct"
 BASE_MODEL_PATH=$MODEL_NAME
 REWARD_MODEL_PATH="trl-lib/Qwen2-0.5B-Reward"
 
-TRAIN_DATA_PATH="/home/ubuntu/chendong/data/tldr/train.parquet"
-VAL_DATA_PATH="/home/ubuntu/chendong/data/tldr/test.parquet"
+TRAIN_DATA_PATH="/root/data/math/train.parquet"
+VAL_DATA_PATH="/root/data/math/test.parquet"
 TRAIN_PROMPT_FILES="['${TRAIN_DATA_PATH}']"
 VAL_PROMPT_FILES="['${VAL_DATA_PATH}']"
 
@@ -32,8 +32,8 @@ N_GPUS_PER_NODE=4
 VISIBLE_DEVICES="4,5,6,7"
 TRAIN_BATCH_SIZE=8
 VAL_BATCH_SIZE=32
-MAX_PROMPT_LENGTH=1024
-MAX_RESPONSE_LENGTH=1024
+MAX_PROMPT_LENGTH=2048
+MAX_RESPONSE_LENGTH=2048
 LEARNING_RATE=1e-7
 DPO_BETA=0.05
 DPO_LOSS_TYPE="sigmoid"
@@ -49,12 +49,12 @@ PARAM_OFFLOAD=False
 OPTIM_OFFLOAD=False
 MODEL_DTYPE="bf16"
 
-ROLLOUT_BACKEND="vllm"
+ROLLOUT_BACKEND="sglang"
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=2
 VLLM_TP_SIZE=2
 VLLM_GPU_MEM_UTIL=0.8
 
-PYTHON_MODULE="verl.recipe.spin.main_dpo"
+PYTHON_MODULE="recipe.spin.main_dpo"
 
 COMMAND="CUDA_VISIBLE_DEVICES=${VISIBLE_DEVICES} PYTHONUNBUFFERED=1 python3 -m ${PYTHON_MODULE} \
     ++data.train_files=\"${TRAIN_PROMPT_FILES}\" \
@@ -89,7 +89,7 @@ COMMAND="CUDA_VISIBLE_DEVICES=${VISIBLE_DEVICES} PYTHONUNBUFFERED=1 python3 -m $
     ++trainer.test_freq=${TEST_FREQ} \
     ++trainer.log_freq=${LOG_FREQ} \
     ++trainer.total_epochs=${TOTAL_EPOCHS} \
-    ++trainer.val_before_train=True"
+    ++trainer.val_before_train=False"
 
 echo "Running command:"
 echo "${COMMAND}"

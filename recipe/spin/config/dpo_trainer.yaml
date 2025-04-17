@@ -19,7 +19,7 @@ data:
 actor_rollout_ref:
   hybrid_engine: True
   model:
-    path: Qwen/Qwen2.5-1.5B-Instruct
+    path: Qwen/Qwen2.5-7B-Instruct
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: True
@@ -75,7 +75,7 @@ actor_rollout_ref:
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
   rollout:
-    name: vllm
+    name: sglang
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1
@@ -122,7 +122,7 @@ critic:
     total_training_steps: -1  # must be override by program
     weight_decay: 0.01
   model:
-    path: Qwen/Qwen2.5-1.5B-Instruct
+    path: Qwen/Qwen2.5-7B-Instruct
     tokenizer_path: ${actor_rollout_ref.model.path}
     override_config: { }
     external_lib: ${actor_rollout_ref.model.external_lib}

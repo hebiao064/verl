@@ -302,26 +302,94 @@ class RayPPOTrainer(object):
             assert config.actor_rollout_ref.rollout.temperature > 0, \
                 "validation gen temperature should be greater than 0 when enabling do_sample"
         print("[validate_config] All configuration checks passed successfully!")
+    
+    # def _create_dataloader(self):
+    #     self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
+    #                                      tokenizer=self.tokenizer,
+    #                                      processor=self.processor,
+    #                                      prompt_key=self.config.data.prompt_key,
+    #                                      image_key=self.config.data.get('image_key', 'images'),
+    #                                      max_prompt_length=self.config.data.max_prompt_length,
+    #                                      return_raw_chat=self.config.data.get('return_raw_chat', False),
+    #                                      truncation=self.config.data.get('truncation', 'error'),
+    #                                      filter_overlong_prompts=self.config.data.filter_overlong_prompts,
+    #                                      num_workers=self.config.data.get('filter_overlong_prompts_workers', None))
+    #     assert self.train_dataset.truncation == self.config.data.get(
+    #         'truncation', 'error'
+    #     ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
+    #     if self.config.data.shuffle:
+    #         train_dataloader_generator = torch.Generator()
+    #         train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
+    #         sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
+    #     else:
+    #         sampler = SequentialSampler(data_source=self.train_dataset)
+    #     self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
+    #                                                batch_size=self.config.data.get('gen_batch_size',
+    #                                                                                self.config.data.train_batch_size),
+    #                                                num_workers=8,
+    #                                                drop_last=True,
+    #                                                collate_fn=collate_fn,
+    #                                                sampler=sampler)
+    #     self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
+    #                                    tokenizer=self.tokenizer,
+    #                                    processor=self.processor,
+    #                                    prompt_key=self.config.data.prompt_key,
+    #                                    image_key=self.config.data.get('image_key', 'images'),
+    #                                    max_prompt_length=self.config.data.max_prompt_length,
+    #                                    return_raw_chat=self.config.data.get('return_raw_chat', False),
+    #                                    truncation=self.config.data.get('truncation', 'error'),
+    #                                    filter_overlong_prompts=self.config.data.filter_overlong_prompts,
+    #                                    num_workers=self.config.data.get('filter_overlong_prompts_workers', None))
+    #     assert self.val_dataset.truncation == self.config.data.get(
+    #         'truncation', 'error'
+    #     ), f'dataset truncation {self.val_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
+    #     self.val_dataloader = StatefulDataLoader(
+    #         dataset=self.val_dataset,
+    #         batch_size=len(self.val_dataset),
+    #         num_workers=8,
+    #         shuffle=False,
+    #         drop_last=False,
+    #         collate_fn=collate_fn)
+    #     assert len(self.train_dataloader) >= 1
+    #     assert len(
+    #         self.val_dataloader
+    #     ) == 1, "Validation dataloader must have a single batch, which inference engines will schedule the memory themselves."
+    #     print(f'Size of train dataloader: {len(self.train_dataloader)}')
+    #     total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+    #     if self.config.trainer.total_training_steps is not None:
+    #         total_training_steps = self.config.trainer.total_training_steps
+    #     self.total_training_steps = total_training_steps
+    #     print(f'Total training steps: {self.total_training_steps}')
+    #     OmegaConf.set_struct(self.config, True)
+    #     with open_dict(self.config):
+    #         self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
+    #         self.config.critic.optim.total_training_steps = total_training_steps
     def _create_dataloader(self):
-        self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
-                                         tokenizer=self.tokenizer,
-                                         processor=self.processor,
-                                         prompt_key=self.config.data.prompt_key,
-                                         image_key=self.config.data.get('image_key', 'images'),
-                                         max_prompt_length=self.config.data.max_prompt_length,
-                                         return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                         truncation=self.config.data.get('truncation', 'error'),
-                                         filter_overlong_prompts=self.config.data.filter_overlong_prompts,
-                                         num_workers=self.config.data.get('filter_overlong_prompts_workers', None))
-        assert self.train_dataset.truncation == self.config.data.get(
-            'truncation', 'error'
-        ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
+        # TODO: we have to make sure the batch size is divisible by the dp size
+        from verl.utils.import_utils import load_extern_type
+        if "custom_cls" in self.config.data and self.config.data.custom_cls.get("path", None) is not None:
+            dataset_cls = load_extern_type(self.config.data.custom_cls.path, self.config.data.custom_cls.name)
+            if not issubclass(dataset_cls, Dataset):
+                raise TypeError(f"The custom dataset class '{self.config.data.custom_cls.name}' from "
+                                f"'{self.config.data.custom_cls.path}' must inherit from torch.utils.data.Dataset")
+        else:
+            dataset_cls = RLHFDataset
+
+        self.train_dataset = dataset_cls(
+            data_files=self.config.data.train_files,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            config=self.config.data,
+        )
+
+        # use sampler for better ckpt resume
         if self.config.data.shuffle:
             train_dataloader_generator = torch.Generator()
             train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
             sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
+
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
                                                    batch_size=self.config.data.get('gen_batch_size',
                                                                                    self.config.data.train_batch_size),
@@ -329,41 +397,44 @@ class RayPPOTrainer(object):
                                                    drop_last=True,
                                                    collate_fn=collate_fn,
                                                    sampler=sampler)
-        self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
-                                       tokenizer=self.tokenizer,
-                                       processor=self.processor,
-                                       prompt_key=self.config.data.prompt_key,
-                                       image_key=self.config.data.get('image_key', 'images'),
-                                       max_prompt_length=self.config.data.max_prompt_length,
-                                       return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                       truncation=self.config.data.get('truncation', 'error'),
-                                       filter_overlong_prompts=self.config.data.filter_overlong_prompts,
-                                       num_workers=self.config.data.get('filter_overlong_prompts_workers', None))
-        assert self.val_dataset.truncation == self.config.data.get(
-            'truncation', 'error'
-        ), f'dataset truncation {self.val_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
+
+        self.val_dataset = dataset_cls(
+            data_files=self.config.data.val_files,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            config=self.config.data,
+        )
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
+            # Validation datasets are sent to inference engines as a whole batch,
+            # which will schedule the memory themselves.
             batch_size=len(self.val_dataset),
             num_workers=8,
             shuffle=False,
             drop_last=False,
             collate_fn=collate_fn)
+
         assert len(self.train_dataloader) >= 1
         assert len(
             self.val_dataloader
         ) == 1, "Validation dataloader must have a single batch, which inference engines will schedule the memory themselves."
+
         print(f'Size of train dataloader: {len(self.train_dataloader)}')
+
+        # inject total_training_steps to actor/critic optim_config. This is hacky.
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
+
         self.total_training_steps = total_training_steps
         print(f'Total training steps: {self.total_training_steps}')
+
         OmegaConf.set_struct(self.config, True)
         with open_dict(self.config):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
-    
+
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
         generations_to_log = self.config.trainer.log_val_generations
@@ -376,6 +447,7 @@ class RayPPOTrainer(object):
         rng.shuffle(samples)
         samples = samples[:generations_to_log]
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+    
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)

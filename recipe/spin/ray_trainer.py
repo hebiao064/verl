@@ -485,8 +485,11 @@ class RayPPOTrainer(object):
             }
             print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+            print("going to generate sequences")
             test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+    
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            
             print('validation generation end')
             output_ids = test_output_gen_batch.batch['responses']
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
@@ -563,6 +566,7 @@ class RayPPOTrainer(object):
                     metric_dict[pfx] = metric_val
         print(f"DEBUG: _validate returning metrics keys: {metric_dict.keys()}")
         return metric_dict
+    
     def init_workers(self):
         """Init resource pool and worker group"""
         self.resource_pool_manager.create_resource_pool()
@@ -840,6 +844,7 @@ class RayPPOTrainer(object):
                     return
                 progress_bar.update(1)
                 self.global_steps += 1
+    
     def _aggregate_metrics(self, result_proto: DataProto) -> Dict:
         """
         Extracts the metrics dictionary from the DataProto returned by a worker.
@@ -939,12 +944,18 @@ class RayPPOTrainer(object):
                     except Exception as e:
                          print(f"ERROR preparing initial batch: {e}. Skipping.");
                          continue
+                    
                     gen_input_proto = initial_batch_proto
                     pop_batch_keys=['input_ids','attention_mask']; pop_non_tensor_keys=[]
                     if 'position_ids' in gen_input_proto.batch: pop_batch_keys.append('position_ids')
                     if 'multi_modal_inputs' in gen_input_proto.non_tensor_batch:
                          pop_non_tensor_keys.extend(['multi_modal_data','multi_modal_inputs'])
+                    else:
+                        pop_non_tensor_keys.append('raw_prompt_ids')
+                        
                     gen_batch_for_worker = gen_input_proto.pop(batch_keys=pop_batch_keys, non_tensor_batch_keys=pop_non_tensor_keys)
+                    
+                    
                     try:
                         with _timer('gen_1', timing_raw): gen_output_1_proto = actor_wg.generate_sequences(deepcopy(gen_batch_for_worker))
                         with _timer('gen_2', timing_raw): gen_output_2_proto = actor_wg.generate_sequences(deepcopy(gen_batch_for_worker))

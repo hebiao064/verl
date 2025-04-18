@@ -26,7 +26,7 @@ actor_rollout_ref:
     use_remove_padding: False
   actor:
     strategy: fsdp  # This is for backward-compatibility
-    ppo_mini_batch_size: 4
+    ppo_mini_batch_size: 512
     ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
     ppo_micro_batch_size_per_gpu: null
     use_dynamic_bsz: False

@@ -3,7 +3,9 @@
 set -e
 set -x
 
-export HF_HOME=/home/ubuntu/chendong/.cache/huggingface
+export HYDRA_FULL_ERROR=1 
+export HF_HUB_OFFLINE=1
+export HF_HOME=/home/jobuser/.cache/huggingface
 export TRANSFORMERS_CACHE=$HF_HOME/transformers
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 export HF_METRICS_CACHE=$HF_HOME/metrics
@@ -13,12 +15,14 @@ export TOKENIZERS_PARALLELISM=false
 export NCCL_DEBUG=WARN
 export WANDB_API_KEY=25c95cfb8dfe322ae6d944a369d2ae63b65d9ece
 
-MODEL_NAME="Qwen/Qwen2-7B-Instruct"
-BASE_MODEL_PATH=$MODEL_NAME
-REWARD_MODEL_PATH="trl-lib/Qwen2-0.5B-Reward"
 
-TRAIN_DATA_PATH="/root/data/gsm8k/train.parquet"
-VAL_DATA_PATH="/root/data/gsm8k/test.parquet"
+# MODEL_NAME="Qwen/Qwen2-7B-Instruct"
+MODEL_NAME="/shared/public/elr-models/Qwen/Qwen2.5-7B-Instruct/52e20a6f5f475e5c8f6a8ebda4ae5fa6b1ea22ac"
+BASE_MODEL_PATH=$MODEL_NAME
+REWARD_MODEL_PATH="/shared/public/sharing/bhe/qwen/Qwen2-0.5B-Reward"
+
+TRAIN_DATA_PATH="/shared/user/bhe/data/verl/math/train.parquet"
+VAL_DATA_PATH="/shared/user/bhe/data/verl/math/test.parquet"
 TRAIN_PROMPT_FILES="['${TRAIN_DATA_PATH}']"
 VAL_PROMPT_FILES="['${VAL_DATA_PATH}']"
 
@@ -64,6 +68,7 @@ COMMAND="CUDA_VISIBLE_DEVICES=${VISIBLE_DEVICES} PYTHONUNBUFFERED=1 python3 -m $
     ++data.max_prompt_length=${MAX_PROMPT_LENGTH} \
     ++data.max_response_length=${MAX_RESPONSE_LENGTH} \
     ++actor_rollout_ref.model.path=\"${BASE_MODEL_PATH}\" \
+    ++critic.model.path=\"${BASE_MODEL_PATH}\" \
     ++actor_rollout_ref.model.enable_gradient_checkpointing=${ENABLE_GC} \
     ++actor_rollout_ref.model.fsdp_config.model_dtype=${MODEL_DTYPE} \
     ++actor_rollout_ref.actor.optim.lr=${LEARNING_RATE} \

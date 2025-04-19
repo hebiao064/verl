@@ -764,6 +764,7 @@ class CriticWorker(Worker):
         from torch import nn
 
         trust_remote_code = False
+        print(f"Biao's local_path for critic model: {local_path}")
         critic_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
         critic_model_config.num_labels = 1
 

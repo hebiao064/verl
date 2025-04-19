@@ -608,6 +608,7 @@ class RayPPOTrainer(object):
             self.wg_dicts.append(wg_dict)
         if self.use_critic:
             self.critic_wg = all_wg['critic']
+            print(f"Biao critic_wg: {self.critic_wg}")
             self.critic_wg.init_model()
         if self.use_reference_policy:
             self.ref_policy_wg = all_wg['ref']

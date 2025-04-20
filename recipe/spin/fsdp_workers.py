@@ -419,6 +419,7 @@ class ActorRolloutRefWorker(Worker):
                                               actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout:
+            print(f"Building rollout for {self.config.rollout.name}")
             self.rollout, self.rollout_sharding_manager = self._build_rollout(
                 trust_remote_code=self.config.model.get('trust_remote_code', False))
 

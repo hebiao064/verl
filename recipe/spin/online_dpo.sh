@@ -19,7 +19,7 @@ export WANDB_API_KEY=25c95cfb8dfe322ae6d944a369d2ae63b65d9ece
 # MODEL_NAME="Qwen/Qwen2-7B-Instruct"
 MODEL_NAME="/shared/public/elr-models/Qwen/Qwen2.5-7B-Instruct/52e20a6f5f475e5c8f6a8ebda4ae5fa6b1ea22ac"
 BASE_MODEL_PATH=$MODEL_NAME
-REWARD_MODEL_PATH="/shared/public/sharing/bhe/qwen/Qwen2-0.5B-Reward"
+REWARD_MODEL_PATH="/shared/public/sharing/bhe/qwen/Qwen2-0.5B-Reward/snapshots/80fb188cabd3e854c2fb983f23a153c0e58a69e0"
 
 TRAIN_DATA_PATH="/shared/user/bhe/data/verl/math/train.parquet"
 VAL_DATA_PATH="/shared/user/bhe/data/verl/math/test.parquet"
@@ -53,6 +53,7 @@ PARAM_OFFLOAD=False
 OPTIM_OFFLOAD=False
 MODEL_DTYPE="bf16"
 
+# why vllm
 ROLLOUT_BACKEND="vllm"
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=2
 VLLM_TP_SIZE=2

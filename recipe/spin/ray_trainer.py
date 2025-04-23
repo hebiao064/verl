@@ -29,7 +29,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.tracking import ValidationGenerationsLogger
-from torch.utils.data import RandomSampler, SequentialSampler
+from torch.utils.data import RandomSampler, SequentialSampler, DataLoader
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tensordict import TensorDict
 
@@ -448,124 +448,555 @@ class RayPPOTrainer(object):
         samples = samples[:generations_to_log]
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
     
-    def _validate(self):
-        data_source_lst = []
-        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
-        sample_inputs = []
-        sample_outputs = []
-        sample_scores = []
-        reward_scores_dict: dict[str, list] = defaultdict(list)
-        for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
-            original_prompt_ids = test_batch.batch['input_ids']
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in original_prompt_ids]
-            sample_inputs.extend(input_texts)
-            original_non_tensor_data = test_batch.non_tensor_batch
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
-                return {}
-            input_ids = test_batch.batch['input_ids']
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            if 'multi_modal_inputs' in test_batch.non_tensor_batch.keys():
-                test_gen_batch = test_batch.pop(
-                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                    non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
-                )
-            else:
-                test_gen_batch = test_batch.pop(
-                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                    non_tensor_batch_keys=['raw_prompt_ids'],
-                )
-            test_gen_batch.meta_info = {
-                'eos_token_id': self.tokenizer.eos_token_id,
-                'pad_token_id': self.tokenizer.pad_token_id,
-                'recompute_log_prob': False,
-                'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                'validate': True,
-            }
-            print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            print("going to generate sequences")
-            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+    # def _validate(self):
+    #     data_source_lst = []
+    #     reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+    #     sample_inputs = []
+    #     sample_outputs = []
+    #     sample_scores = []
+    #     reward_scores_dict: dict[str, list] = defaultdict(list)
+    #     for test_data in self.val_dataloader:
+    #         test_batch = DataProto.from_single_dict(test_data)
+    #         original_prompt_ids = test_batch.batch['input_ids']
+    #         input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in original_prompt_ids]
+    #         sample_inputs.extend(input_texts)
+    #         original_non_tensor_data = test_batch.non_tensor_batch
+    #         if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
+    #             return {}
+    #         input_ids = test_batch.batch['input_ids']
+    #         input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+    #         sample_inputs.extend(input_texts)
+    #         if 'multi_modal_inputs' in test_batch.non_tensor_batch.keys():
+    #             test_gen_batch = test_batch.pop(
+    #                 batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+    #                 non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+    #             )
+    #         else:
+    #             test_gen_batch = test_batch.pop(
+    #                 batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+    #                 non_tensor_batch_keys=['raw_prompt_ids'],
+    #             )
+    #         test_gen_batch.meta_info = {
+    #             'eos_token_id': self.tokenizer.eos_token_id,
+    #             'pad_token_id': self.tokenizer.pad_token_id,
+    #             'recompute_log_prob': False,
+    #             'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+    #             'validate': True,
+    #         }
+    #         print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
+    #         test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+    #         print("going to generate sequences")
+    #         test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
     
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+    #         test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             
-            print('validation generation end')
-            output_ids = test_output_gen_batch.batch['responses']
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
-            if self.config.reward_model.enable:
-                rm_tensors = {
-                     'input_ids': test_output_gen_batch.batch['input_ids'],
-                     'attention_mask': test_output_gen_batch.batch['attention_mask'],
-                     'responses': test_output_gen_batch.batch['responses'],
-                     'position_ids': test_output_gen_batch.batch.get('position_ids'),
+    #         print('validation generation end')
+    #         output_ids = test_output_gen_batch.batch['responses']
+    #         output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+    #         sample_outputs.extend(output_texts)
+    #         if self.config.reward_model.enable:
+    #             rm_tensors = {
+    #                  'input_ids': test_output_gen_batch.batch['input_ids'],
+    #                  'attention_mask': test_output_gen_batch.batch['attention_mask'],
+    #                  'responses': test_output_gen_batch.batch['responses'],
+    #                  'position_ids': test_output_gen_batch.batch.get('position_ids'),
+    #             }
+    #             rm_tensors = {k: v for k, v in rm_tensors.items() if v is not None}
+    #             rm_input_proto = DataProto.from_dict(tensors=rm_tensors)
+    #             rm_non_tensor_batch_data = {}
+    #             if 'raw_prompt_ids' in original_non_tensor_data:
+    #                  rm_non_tensor_batch_data['raw_prompt'] = original_non_tensor_data['raw_prompt_ids']
+    #             if 'data_source' in original_non_tensor_data:
+    #                  rm_non_tensor_batch_data['data_source'] = original_non_tensor_data['data_source']
+    #             rm_input_proto.non_tensor_batch = rm_non_tensor_batch_data
+    #             rm_input_proto_padded, rm_pad_size = pad_dataproto_to_divisor(rm_input_proto, self.rm_wg.world_size)
+    #             rm_scores_proto_padded = self.rm_wg.compute_rm_score(rm_input_proto_padded)
+    #             rm_scores_proto = unpad_dataproto(rm_scores_proto_padded, pad_size=rm_pad_size)
+    #             token_level_rm_scores = rm_scores_proto.batch['rm_scores']
+    #             rm_scalar_scores = token_level_rm_scores.sum(dim=1)
+    #             scores = rm_scalar_scores.cpu().tolist()
+    #             sample_scores.extend(scores)
+    #             reward_scores_dict["reward"].extend(scores)
+    #             if 'data_source' in original_non_tensor_data:
+    #                 data_source_lst.append(original_non_tensor_data.get('data_source', ['unknown'] * len(scores)))
+    #             else:
+    #                 ds_name = self.config.data.train_files[0]
+    #                 if 'tldr' in ds_name: ds_name='trl-lib/tldr'
+    #                 elif 'gsm8k' in ds_name: ds_name='openai/gsm8k'
+    #                 else: ds_name = 'unknown'
+    #                 data_source_lst.append([ds_name] * len(scores))
+    #         else:
+    #              print("Warning: Reward model is disabled, cannot compute validation scores.")
+    #              scores = [0.0] * len(output_texts)
+    #              sample_scores.extend(scores)
+    #              reward_scores_dict["reward"].extend(scores)
+    #              data_source_lst.append(['unknown'] * len(scores))
+    #     self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+    #     for key_info, lst in reward_extra_infos_dict.items():
+    #         assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+    #     if not data_source_lst:
+    #              print("Warning: No validation data processed.")
+    #              return {}
+    #     data_sources = np.concatenate(data_source_lst, axis=0) if data_source_lst else np.array([])
+    #     if 'reward' in reward_scores_dict:
+    #         reward_list = reward_scores_dict['reward']
+    #         if reward_list:
+    #             has_nan = np.isnan(reward_list).any()
+    #             has_inf = np.isinf(reward_list).any()
+    #     data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_scores_dict)
+    #     metric_dict = {}
+    #     for data_source, var2metric2val in data_src2var2metric2val.items():
+    #         core_var = "reward"
+    #         for var_name, metric2val in var2metric2val.items():
+    #             if not metric2val:
+    #                 continue
+    #             n_max = 1
+    #             try:
+    #                 keys_with_at = [k for k in metric2val.keys() if "@" in k]
+    #                 if keys_with_at:
+    #                     n_max = max([int(name.split("@")[-1].split("/")[0]) for name in keys_with_at])
+    #             except Exception as e_nmax:
+    #                 print(f"DEBUG: Error calculating n_max: {e_nmax}")
+    #             for metric_name, metric_val in metric2val.items():
+    #                 if var_name == core_var and any(metric_name.startswith(pfx) for pfx in ["mean", "std", "maj", "best"]):
+    #                     metric_sec = "val-core"
+    #                 else:
+    #                     metric_sec = "val-aux"
+    #                 pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+    #                 metric_dict[pfx] = metric_val
+    #     print(f"DEBUG: _validate returning metrics keys: {metric_dict.keys()}")
+    #     return metric_dict
+    # def _validate(self):
+    #     data_source_lst = []
+    #     reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+
+    #     # Lists to collect samples for the table
+    #     sample_inputs = []
+    #     sample_outputs = []
+    #     sample_scores = []
+
+    #     for test_data in self.val_dataloader:
+    #         test_batch = DataProto.from_single_dict(test_data)
+
+    #         # repeat test batch
+    #         test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
+    #                                        interleave=True)
+
+    #         # we only do validation on rule-based rm
+    #         if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
+    #             return {}
+
+    #         # Store original inputs
+    #         input_ids = test_batch.batch['input_ids']
+    #         # TODO: Can we keep special tokens except for padding tokens?
+    #         input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+    #         sample_inputs.extend(input_texts)
+
+    #         if 'multi_modal_inputs' in test_batch.non_tensor_batch.keys():
+    #             test_gen_batch = test_batch.pop(
+    #                 batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+    #                 non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+    #             )
+    #         else:
+    #             test_gen_batch = test_batch.pop(
+    #                 batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+    #                 non_tensor_batch_keys=['raw_prompt_ids'],
+    #             )
+
+    #         test_gen_batch.meta_info = {
+    #             'eos_token_id': self.tokenizer.eos_token_id,
+    #             'pad_token_id': self.tokenizer.pad_token_id,
+    #             'recompute_log_prob': False,
+    #             'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+    #             'validate': True,
+    #         }
+    #         print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
+
+    #         # pad to be divisible by dp_size
+    #         test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+    #         test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+
+    #         # unpad
+    #         test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+    #         print('validation generation end')
+
+    #         # Store generated outputs
+    #         output_ids = test_output_gen_batch.batch['responses']
+    #         output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+    #         sample_outputs.extend(output_texts)
+
+    #         test_batch = test_batch.union(test_output_gen_batch)
+
+    #         # evaluate using reward_function
+    #         result = self.val_reward_fn(test_batch, return_dict=True)
+    #         reward_tensor = result["reward_tensor"]
+    #         scores = reward_tensor.sum(-1).cpu().tolist()
+    #         sample_scores.extend(scores)
+
+    #         reward_extra_infos_dict["reward"].extend(scores)
+    #         if "reward_extra_info" in result:
+    #             for key, lst in result["reward_extra_info"].items():
+    #                 reward_extra_infos_dict[key].extend(lst)
+
+    #         data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+
+    #     self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+    #     for key_info, lst in reward_extra_infos_dict.items():
+    #         assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+
+    #     data_sources = np.concatenate(data_source_lst, axis=0)
+
+    #     data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+    #     metric_dict = {}
+    #     for data_source, var2metric2val in data_src2var2metric2val.items():
+    #         core_var = "acc" if "acc" in var2metric2val else "reward"
+    #         for var_name, metric2val in var2metric2val.items():
+    #             n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+    #             for metric_name, metric_val in metric2val.items():
+    #                 if (var_name == core_var) and any(
+    #                         metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"]) and (f"@{n_max}"
+    #                                                                                              in metric_name):
+    #                     metric_sec = "val-core"
+    #                 else:
+    #                     metric_sec = "val-aux"
+    #                 pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+    #                 metric_dict[pfx] = metric_val
+
+    #     return metric_dict
+    
+    def _validate(self):
+        # --- Add global_steps access if needed for logging ---
+        current_step = getattr(self, 'global_steps', 'N/A')
+        print(f"\nRunning validation at DPO step {current_step}...")
+
+        # --- Keep track of results across batches ---
+        all_input_texts = []
+        all_output_texts = []
+        all_rm_scores = []
+        data_source_lst = [] # Collect data sources per batch
+        reward_scores_dict: dict[str, list] = defaultdict(list) # To pass to process_validation_metrics
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list) # To pass to process_validation_metrics
+
+        # --- Define a reasonable validation batch size ---
+        # ---> SET YOUR SMALL BATCH SIZE HERE <---
+        # Start very small (e.g., 8, 16, 32). 16 is a safe start based on previous logs.
+        validation_batch_size = 16
+        # ---> END SETTING BATCH SIZE <---
+        print(f"Processing validation set in batches of {validation_batch_size}...")
+
+        # Ensure self.val_dataset is accessible (should be created in _create_dataloader)
+        if not hasattr(self, 'val_dataset') or self.val_dataset is None:
+             print("ERROR: self.val_dataset not found in trainer. Cannot run validation.")
+             return {}
+
+        # --- Create a *new* DataLoader specifically for batched validation inference ---
+        val_sampler = SequentialSampler(self.val_dataset) # Process in order
+        # Use the existing collate_fn
+        val_dataloader_for_inference = DataLoader(
+            self.val_dataset,
+            batch_size=validation_batch_size, # Use the small batch size
+            sampler=val_sampler,
+            collate_fn=collate_fn,
+            num_workers=self.config.data.get("num_workers", 4), # Use config value or default
+            drop_last=False # Process all validation samples
+        )
+        # --- End DataLoader Creation ---
+
+        # --- Loop through small validation batches ---
+        for batch_idx, val_batch_dict in enumerate(tqdm(val_dataloader_for_inference, desc="Validation Generation Batches")):
+            try:
+                test_batch = DataProto.from_single_dict(val_batch_dict)
+                current_batch_size = test_batch.batch.batch_size[0] # Get actual batch size
+
+                # Repeat test batch if needed (from your previous version)
+                # Note: Repeating might increase memory usage if 'n' > 1
+                n_repeat = self.config.actor_rollout_ref.rollout.val_kwargs.get('n', 1)
+                if n_repeat > 1:
+                    # Careful: Repeating non-tensor data needs manual handling if process_validation_metrics needs it later
+                    print(f"Warning: Repeating validation batch {n_repeat} times. Ensure non-tensor data is handled if needed.")
+                    test_batch = test_batch.repeat(repeat_times=n_repeat, interleave=True)
+                    # Update batch size for tracking
+                    current_batch_size *= n_repeat
+
+
+                # Store original inputs (do this *before* repeating if you only want unique inputs logged)
+                # Let's assume we want inputs corresponding to each generated output
+                original_prompt_ids = test_batch.batch['input_ids'] # Use potentially repeated ids
+                input_texts_batch = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in original_prompt_ids]
+                all_input_texts.extend(input_texts_batch) # Accumulate
+
+                original_non_tensor_data = test_batch.non_tensor_batch # Store non-tensor for RM step
+
+                # --- Prepare batch for generation worker ---
+                # Adjust pop keys based on your actual data structure
+                pop_batch_keys=['input_ids', 'attention_mask']
+                if 'position_ids' in test_batch.batch: pop_batch_keys.append('position_ids')
+                # Only pop keys needed for generation, keep original non-tensor data if needed later by RM
+                pop_non_tensor_keys = []
+                if 'multi_modal_inputs' in test_batch.non_tensor_batch:
+                    pop_non_tensor_keys.extend(['multi_modal_data', 'multi_modal_inputs'])
+
+                # Use deepcopy to avoid modifying the original test_batch needed for RM
+                gen_batch_for_worker = deepcopy(test_batch).pop(
+                    batch_keys=pop_batch_keys,
+                    non_tensor_batch_keys=pop_non_tensor_keys,
+                )
+
+                # --- Set Meta Info for Generation ---
+                gen_meta = {
+                    'eos_token_id': self.tokenizer.eos_token_id,
+                    'pad_token_id': self.tokenizer.pad_token_id,
+                    'recompute_log_prob': False,
+                    'validate': True,
                 }
-                rm_tensors = {k: v for k, v in rm_tensors.items() if v is not None}
-                rm_input_proto = DataProto.from_dict(tensors=rm_tensors)
-                rm_non_tensor_batch_data = {}
-                if 'raw_prompt_ids' in original_non_tensor_data:
-                     rm_non_tensor_batch_data['raw_prompt'] = original_non_tensor_data['raw_prompt_ids']
-                if 'data_source' in original_non_tensor_data:
-                     rm_non_tensor_batch_data['data_source'] = original_non_tensor_data['data_source']
-                rm_input_proto.non_tensor_batch = rm_non_tensor_batch_data
-                rm_input_proto_padded, rm_pad_size = pad_dataproto_to_divisor(rm_input_proto, self.rm_wg.world_size)
-                rm_scores_proto_padded = self.rm_wg.compute_rm_score(rm_input_proto_padded)
-                rm_scores_proto = unpad_dataproto(rm_scores_proto_padded, pad_size=rm_pad_size)
-                token_level_rm_scores = rm_scores_proto.batch['rm_scores']
-                rm_scalar_scores = token_level_rm_scores.sum(dim=1)
-                scores = rm_scalar_scores.cpu().tolist()
-                sample_scores.extend(scores)
-                reward_scores_dict["reward"].extend(scores)
-                if 'data_source' in original_non_tensor_data:
-                    data_source_lst.append(original_non_tensor_data.get('data_source', ['unknown'] * len(scores)))
+                gen_meta.update(self.config.actor_rollout_ref.rollout.val_kwargs) # Add kwargs like do_sample, temp, etc.
+                gen_meta['n'] = n_repeat # Pass n value
+                gen_batch_for_worker.meta_info = gen_meta
+                # print(f'DEBUG: test_gen_batch meta info: {gen_batch_for_worker.meta_info}') # Debug
+
+                # --- Generate sequences for the small batch ---
+                gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch_for_worker, self.actor_rollout_wg.world_size)
+                # print(f"DEBUG: Going to generate sequences for batch {batch_idx}") # Debug
+                output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(gen_batch_padded)
+                test_output_gen_batch = unpad_dataproto(output_gen_batch_padded, pad_size=pad_size)
+                # print(f"DEBUG: validation generation batch {batch_idx} end") # Debug
+
+                # --- Process results for this batch ---
+                output_ids = test_output_gen_batch.batch.get('responses')
+                if output_ids is None:
+                     print(f"\nWarning: No 'responses' found in generation output for validation batch {batch_idx}. Skipping.")
+                     # Append dummy data to keep lists aligned
+                     all_output_texts.extend(["<GENERATION FAILED>"] * current_batch_size)
+                     all_rm_scores.extend([0.0] * current_batch_size)
+                     data_source_lst.extend(['unknown_gen_failed'] * current_batch_size)
+                     reward_scores_dict["reward"].extend([0.0] * current_batch_size)
+                     continue # Skip rest of loop for this batch
+
+                output_texts_batch = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+                all_output_texts.extend(output_texts_batch) # Accumulate
+
+                # --- Get RM scores / Use val_reward_fn ---
+                if self.val_reward_fn:
+                    # Reconstruct the batch with prompts and responses for reward function
+                    # Use the generated output which contains the full sequence
+                    # --- Corrected block ---
+                    rm_tensors_dict = {
+                        'input_ids': test_output_gen_batch.batch['input_ids'], # Prompt + Response IDs from generator
+                        'attention_mask': test_output_gen_batch.batch['attention_mask'], # Mask for prompt + response
+                        'responses': output_ids, # Just the response IDs
+                        'position_ids': test_output_gen_batch.batch.get('position_ids'), # Position IDs for prompt + response
+                    }
+                    # Filter out None tensors BEFORE creating DataProto
+                    rm_tensors_dict_filtered = {k: v for k,v in rm_tensors_dict.items() if v is not None}
+
+                    # Create DataProto using only the tensors argument
+                    batch_for_reward = DataProto.from_dict(tensors=rm_tensors_dict_filtered)
+
+                    # Assign non_tensor_batch attribute AFTER creation
+                    batch_for_reward.non_tensor_batch = original_non_tensor_data # Use original non-tensor data
+
+                    # Ensure the batch attribute has the correct batch_size set if needed by TensorDict operations
+                    if hasattr(batch_for_reward, 'batch') and isinstance(batch_for_reward.batch, TensorDict):
+                        batch_for_reward.batch._batch_size = torch.Size([current_batch_size]) # Explicitly set batch size if needed
+                    # --- End Corrected block ---
+
+
+
+                    # --- DETAILED DEBUG LOGGING BEFORE RM CALL ---
+                    print(f"\n---- DEBUG: Checking Inputs Sent to compute_rm_score (Batch {batch_idx}) ----")
+                    try:
+                        # Assuming RM vocab size is same as actor/tokenizer for now
+                        rm_vocab_size = self.tokenizer.vocab_size
+                        print(f"Assumed RM Vocab Size: {rm_vocab_size}")
+
+                        # Check tensors within the batch that will be sent (before padding)
+                        tensors_to_check_rm = batch_for_reward.batch
+                        for key, tensor in tensors_to_check_rm.items():
+                            print(f"  Tensor '{key}':")
+                            if tensor is None: print("    Tensor is None!"); continue
+                            print(f"    Shape: {tensor.shape}")
+                            print(f"    DType: {tensor.dtype}")
+                            if torch.is_floating_point(tensor):
+                                if torch.isnan(tensor).any(): print(f"    ERROR: NaN found in {key}!")
+                                if torch.isinf(tensor).any(): print(f"    ERROR: Inf found in {key}!")
+                            if tensor.numel() == 0: print("    Tensor is empty!"); continue
+
+                            try:
+                                min_val, max_val = tensor.min().item(), tensor.max().item()
+                                print(f"    Min Value: {min_val}")
+                                print(f"    Max Value: {max_val}")
+                                if 'input_ids' in key or 'responses' in key: # Check token ids
+                                    if min_val < 0: print(f"    ERROR: Negative id in {key}!")
+                                    if max_val >= rm_vocab_size: print(f"    ERROR: id >= vocab_size in {key}!")
+                                elif 'attention_mask' in key:
+                                    if not torch.all((tensor.float() == 0.0) | (tensor.float() == 1.0)): print(f"    ERROR: {key} has values other than 0 or 1!")
+                                elif 'position_ids' in key:
+                                    seq_len = tensor.shape[1]
+                                    if min_val < 0: print(f"    ERROR: Negative position_id!")
+                                    if max_val >= seq_len: print(f"    ERROR: position_id {max_val} >= seq len {seq_len}!")
+                            except Exception as e_check: print(f"    ERROR checking min/max for {key}: {e_check}")
+                        print("    Non-Tensor Keys:", list(batch_for_reward.non_tensor_batch.keys()))
+                    except Exception as e_debug:
+                        print(f"ERROR during pre-RM debug checks: {e_debug}")
+                    print("-----------------------------------------------------------")
+                    # --- END DETAILED DEBUG LOGGING ---
+
+
+                    try: # Add try-except around RM scoring per batch
+                         # Pad the batch for the RM worker group size
+                         rm_input_proto_padded, rm_pad_size = pad_dataproto_to_divisor(batch_for_reward, self.rm_wg.world_size)
+                         # Call the reward function / RM worker
+                         rm_scores_proto_padded = self.rm_wg.compute_rm_score(rm_input_proto_padded)
+                         rm_scores_proto = unpad_dataproto(rm_scores_proto_padded, pad_size=rm_pad_size)
+
+                         # Process reward function output (adapted from your original code)
+                         token_level_rm_scores = rm_scores_proto.batch.get('rm_scores')
+                         if token_level_rm_scores is not None:
+                             rm_scalar_scores = token_level_rm_scores.sum(dim=1)
+                             batch_scores = rm_scalar_scores.cpu().tolist()
+                         else:
+                             print(f"\nWarning: No 'rm_scores' found in RM output for validation batch {batch_idx}. Using val_reward_fn directly if possible.")
+                             # Fallback maybe? Depends on val_reward_fn structure
+                             # This part might need adjustment based on how your val_reward_fn provides scores
+                             batch_scores = [0.0] * current_batch_size # Default to 0 if no scores
+
+                         # Accumulate standard reward scores
+                         all_rm_scores.extend(batch_scores)
+                         reward_scores_dict["reward"].extend(batch_scores)
+
+                         # Accumulate extra info if reward_fn provides it (e.g., in rm_scores_proto.meta_info)
+                         # This part needs to align with how your rm_worker / val_reward_fn returns extra info
+                         if 'reward_extra_info' in rm_scores_proto.meta_info:
+                             for key, lst in rm_scores_proto.meta_info["reward_extra_info"].items():
+                                 if len(lst) == current_batch_size:
+                                     reward_extra_infos_dict[key].extend(lst)
+                                 else:
+                                     print(f"Warning: Length mismatch for reward_extra_info '{key}' in validation batch.")
+                                     reward_extra_infos_dict[key].extend([None]*current_batch_size)
+
+                         # Determine data source for this batch
+                         if 'data_source' in original_non_tensor_data:
+                              ds_batch = original_non_tensor_data.get('data_source', ['unknown'] * current_batch_size)
+                              # Handle potential repetition if n_repeat > 1
+                              if n_repeat > 1 and len(ds_batch) == current_batch_size // n_repeat:
+                                  ds_batch = [item for item in ds_batch for _ in range(n_repeat)]
+                              data_source_lst.extend(ds_batch[:current_batch_size]) # Ensure correct length
+                         else: # Fallback
+                              ds_name = self.config.data.val_files[0] if self.config.data.val_files else 'unknown_val'
+                              # Simple name derivation (you might need better logic)
+                              if 'tldr' in ds_name: ds_name='trl-lib/tldr'
+                              elif 'gsm8k' in ds_name: ds_name='openai/gsm8k'
+                              data_source_lst.extend([ds_name] * current_batch_size)
+
+                    except Exception as e:
+                         print(f"\nERROR during validation RM scoring batch {batch_idx}: {e}. Appending zeros for batch.")
+                         all_rm_scores.extend([0.0] * current_batch_size)
+                         reward_scores_dict["reward"].extend([0.0] * current_batch_size)
+                         data_source_lst.extend(['unknown_reward_error'] * current_batch_size)
+                         # Also add placeholders for extra info if needed for consistent length
+                         for key in reward_extra_infos_dict: reward_extra_infos_dict[key].extend([None]*current_batch_size)
                 else:
-                    ds_name = self.config.data.train_files[0]
-                    if 'tldr' in ds_name: ds_name='trl-lib/tldr'
-                    elif 'gsm8k' in ds_name: ds_name='openai/gsm8k'
-                    else: ds_name = 'unknown'
-                    data_source_lst.append([ds_name] * len(scores))
-            else:
-                 print("Warning: Reward model is disabled, cannot compute validation scores.")
-                 scores = [0.0] * len(output_texts)
-                 sample_scores.extend(scores)
-                 reward_scores_dict["reward"].extend(scores)
-                 data_source_lst.append(['unknown'] * len(scores))
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-        for key_info, lst in reward_extra_infos_dict.items():
-            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
-        if not data_source_lst:
-                 print("Warning: No validation data processed.")
-                 return {}
-        data_sources = np.concatenate(data_source_lst, axis=0) if data_source_lst else np.array([])
-        if 'reward' in reward_scores_dict:
-            reward_list = reward_scores_dict['reward']
-            if reward_list:
-                has_nan = np.isnan(reward_list).any()
-                has_inf = np.isinf(reward_list).any()
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_scores_dict)
-        metric_dict = {}
-        for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "reward"
-            for var_name, metric2val in var2metric2val.items():
-                if not metric2val:
-                    continue
-                n_max = 1
-                try:
-                    keys_with_at = [k for k in metric2val.keys() if "@" in k]
-                    if keys_with_at:
-                        n_max = max([int(name.split("@")[-1].split("/")[0]) for name in keys_with_at])
-                except Exception as e_nmax:
-                    print(f"DEBUG: Error calculating n_max: {e_nmax}")
-                for metric_name, metric_val in metric2val.items():
-                    if var_name == core_var and any(metric_name.startswith(pfx) for pfx in ["mean", "std", "maj", "best"]):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
+                     # Append dummy scores if no reward function
+                     print("Warning: No validation reward function (self.val_reward_fn) provided.")
+                     all_rm_scores.extend([0.0] * current_batch_size)
+                     reward_scores_dict["reward"].extend([0.0] * current_batch_size)
+                     data_source_lst.extend(['unknown_no_reward_fn'] * current_batch_size)
+
+
+            except Exception as batch_processing_error:
+                print(f"\nERROR processing validation batch {batch_idx}: {batch_processing_error}. Skipping batch.")
+                # Estimate batch size if possible, otherwise use planned size
+                batch_size_in_dict = len(val_batch_dict.get('input_ids', [])) if val_batch_dict else validation_batch_size
+                # Append placeholders to maintain list alignment
+                all_input_texts.extend(["<INPUT ERROR>"] * batch_size_in_dict)
+                all_output_texts.extend(["<PROCESSING ERROR>"] * batch_size_in_dict)
+                all_rm_scores.extend([0.0] * batch_size_in_dict)
+                data_source_lst.extend(['unknown_batch_error'] * batch_size_in_dict)
+                reward_scores_dict["reward"].extend([0.0] * batch_size_in_dict)
+                for key in reward_extra_infos_dict: reward_extra_infos_dict[key].extend([None]*batch_size_in_dict)
+                continue # Skip to next batch
+
+        # --- End Batch Loop ---
+        print("\nValidation generation and scoring complete.")
+
+        # --- Calculate final metrics using accumulated results ---
+        self._maybe_log_val_generations(inputs=all_input_texts, outputs=all_output_texts, scores=all_rm_scores)
+
+        # Check if any results were collected
+        num_processed = len(all_input_texts)
+        if not data_source_lst or not reward_scores_dict.get("reward") or num_processed == 0:
+            print("Warning: No valid validation results collected after processing batches.")
+            return {}
+
+        # Ensure data_sources is correctly formed relative to processed items
+        # This assumes the order is preserved by SequentialSampler and DataLoader
+        if len(data_source_lst) != num_processed:
+             print(f"Warning: Length mismatch between collected data_source_lst ({len(data_source_lst)}) and processed items ({num_processed}). Trying recovery.")
+             try:
+                 data_sources = np.array([item.get(self.config.data.reward_fn_key, 'unknown')
+                                          for item in self.val_dataset])[:num_processed] # Slice to match processed
+                 if len(data_sources) != num_processed:
+                      raise ValueError(f"Length mismatch even after slicing dataset sources ({len(data_sources)} vs {num_processed})")
+             except Exception as e:
+                 print(f"ERROR: Could not accurately determine data sources for metrics: {e}.")
+                 # Use collected list only if it matches the reward list length (fallback)
+                 if len(data_source_lst) == len(reward_scores_dict["reward"]):
+                     print("Using collected data_source_lst as fallback.")
+                     data_sources = np.array(data_source_lst)
+                 else:
+                     print("ERROR: Cannot proceed with metric calculation due to length mismatch.")
+                     return {"val-core/error": 1}
+        else:
+             data_sources = np.array(data_source_lst)
+
+        # Final length check before processing metrics
+        final_reward_scores = reward_scores_dict["reward"]
+        if len(data_sources) != num_processed or len(final_reward_scores) != num_processed:
+            print(f"ERROR: Final length mismatch before metric processing. "
+                  f"DataSources: {len(data_sources)}, Scores: {len(final_reward_scores)}. Should be {num_processed}. Cannot compute metrics.")
+            return {"val-core/error": 1}
+
+        # Process final metrics using accumulated dictionaries
+        try:
+            # Combine standard reward with any extra info for processing
+            reward_info_for_metrics = reward_scores_dict.copy()
+            # Make sure extra info lists have same length as standard reward list
+            for k, v_list in reward_extra_infos_dict.items():
+                if len(v_list) == len(final_reward_scores):
+                     reward_info_for_metrics[k] = v_list
+                else:
+                     print(f"Warning: Length mismatch for extra info '{k}' ({len(v_list)} vs {len(final_reward_scores)}). Skipping.")
+
+            # Use the combined dict for processing
+            data_src2var2metric2val = process_validation_metrics(data_sources, all_input_texts, reward_info_for_metrics)
+            metric_dict = {}
+            for data_source, var2metric2val in data_src2var2metric2val.items():
+                 # Use logic from your provided code to determine core_var etc.
+                 core_var = "acc" if "acc" in var2metric2val else "reward"
+                 for var_name, metric2val in var2metric2val.items():
+                     if not metric2val: continue
+                     try: # Safer n_max calculation
+                         n_max_keys = [int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys() if "@" in name]
+                         n_max = max(n_max_keys) if n_max_keys else 1
+                     except ValueError: n_max = 1 # Handle cases where parsing fails
+
+                     for metric_name, metric_val in metric2val.items():
+                         is_core_metric = (var_name == core_var) and \
+                                          any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"]) and \
+                                          (f"@{n_max}" in metric_name or "@" not in metric_name)
+
+                         metric_sec = "val-core" if is_core_metric else "val-aux"
+                         pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                         metric_dict[pfx] = metric_val
+        except Exception as e:
+            print(f"ERROR processing final validation metrics: {e}")
+            # Fallback metric if processing fails
+            metric_dict = {"val-core/overall/reward/mean": np.mean(all_rm_scores) if all_rm_scores else 0.0}
+
         print(f"DEBUG: _validate returning metrics keys: {metric_dict.keys()}")
         return metric_dict
+
     
     def init_workers(self):
         """Init resource pool and worker group"""
@@ -946,8 +1377,8 @@ class RayPPOTrainer(object):
                          continue
                     
                     gen_input_proto = initial_batch_proto
-                    pop_batch_keys=['input_ids','attention_mask']; pop_non_tensor_keys=[]
-                    if 'position_ids' in gen_input_proto.batch: pop_batch_keys.append('position_ids')
+                    pop_batch_keys=['input_ids','attention_mask','position_ids' ]; pop_non_tensor_keys=[]
+                    
                     if 'multi_modal_inputs' in gen_input_proto.non_tensor_batch:
                          pop_non_tensor_keys.extend(['multi_modal_data','multi_modal_inputs'])
                     else:
@@ -955,10 +1386,15 @@ class RayPPOTrainer(object):
                         
                     gen_batch_for_worker = gen_input_proto.pop(batch_keys=pop_batch_keys, non_tensor_batch_keys=pop_non_tensor_keys)
                     
-                    
+                        
                     try:
-                        with _timer('gen_1', timing_raw): gen_output_1_proto = actor_wg.generate_sequences(deepcopy(gen_batch_for_worker))
-                        with _timer('gen_2', timing_raw): gen_output_2_proto = actor_wg.generate_sequences(deepcopy(gen_batch_for_worker))
+                        # with _timer('gen_1', timing_raw): gen_output_1_proto = actor_wg.generate_sequences(deepcopy(gen_batch_for_worker))
+                        # with _timer('gen_2', timing_raw): gen_output_2_proto = actor_wg.generate_sequences(deepcopy(gen_batch_for_worker))
+                        print(f"[Step {self.global_steps}] Calling generate_sequences (Call 1)")
+                        gen_output_1_proto = self.actor_rollout_wg.generate_sequences(deepcopy(gen_batch_for_worker))
+                        print(f"[Step {self.global_steps}] Calling generate_sequences (Call 2)")
+                        gen_output_2_proto = self.actor_rollout_wg.generate_sequences(deepcopy(gen_batch_for_worker)) # Error likely occurs here or during Call 1
+                        print(f"[Step {self.global_steps}] Both generation calls finished.")
                     except Exception as e:
                         print(f"ERROR during generation step {self.global_steps}: {e}. Skipping batch.")
                         step_timer.stop(); continue
@@ -994,6 +1430,8 @@ class RayPPOTrainer(object):
                          except Exception as e:
                               print(f"ERROR processing paired data at step {self.global_steps}: {e}. Skipping batch.")
                               step_timer.stop(); continue
+                    
+                    print(f"[Step {self.global_steps}] Paired data processed successfully.")
                     
                     preference_data = []
                     chosen_scores_list = []
@@ -1071,6 +1509,8 @@ class RayPPOTrainer(object):
                     except Exception as e:
                          print(f"ERROR during log probability calculation at step {self.global_steps}: {e}. Skipping DPO step for this batch.")
                          step_timer.stop(); continue
+                    
+                    print(f"[Step {self.global_steps}] Log probabilities calculated successfully.")
                     
                     dpo_update_batch_proto = None
                     with _timer('prepare_dpo_batch', timing_raw):

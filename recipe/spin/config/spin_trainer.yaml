@@ -80,7 +80,7 @@ actor_rollout_ref:
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
   rollout:
-    name: sglang
+    name: vllm
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1
@@ -97,7 +97,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 2
     max_num_batched_tokens: 8192
     max_model_len: null
-    max_num_seqs: 1024
+    max_num_seqs: 2048
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
@@ -163,7 +163,7 @@ reward_model:
   strategy: fsdp
   model:
     input_tokenizer: null  # set this to null if the chat template is identical
-    path: Qwen/Qwen2.5-0.5B-Instruct
+    path: /shared/public/sharing/bhe/qwen/Qwen2-0.5B-Reward/snapshots/80fb188cabd3e854c2fb983f23a153c0e58a69e0
     external_lib: ${actor_rollout_ref.model.external_lib}
     use_remove_padding: False
     fsdp_config:
@@ -201,7 +201,7 @@ trainer:
   total_training_steps: null
   project_name: verl_spin
   experiment_name: gsm8k
-  logger: [ 'console', 'wandb' ]
+  logger: [ 'console', 'mlflow' ]
   log_val_generations: 0
   nnodes: 1
   n_gpus_per_node: 8

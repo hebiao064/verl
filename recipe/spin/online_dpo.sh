@@ -3,7 +3,9 @@
 set -e
 set -x
 
-export HF_HOME=/home/ubuntu/chendong/.cache/huggingface
+export HYDRA_FULL_ERROR=1 
+export HF_HUB_OFFLINE=1
+export HF_HOME=/home/jobuser/.cache/huggingface
 export TRANSFORMERS_CACHE=$HF_HOME/transformers
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 export HF_METRICS_CACHE=$HF_HOME/metrics
@@ -13,12 +15,12 @@ export TOKENIZERS_PARALLELISM=false
 export NCCL_DEBUG=WARN
 export WANDB_API_KEY=25c95cfb8dfe322ae6d944a369d2ae63b65d9ece
 export TORCH_MEMORY_SAVER=0
-MODEL_NAME="Qwen/Qwen2-7B-Instruct"
+MODEL_NAME="/shared/public/sharing/bhe/qwen/Qwen2-7B-Instruct/snapshots/f2826a00ceef68f0f2b946d945ecc0477ce4450c"
 BASE_MODEL_PATH=$MODEL_NAME
-REWARD_MODEL_PATH="trl-lib/Qwen2-0.5B-Reward"
+REWARD_MODEL_PATH="/shared/public/sharing/bhe/qwen/Qwen2-0.5B-Reward/snapshots/80fb188cabd3e854c2fb983f23a153c0e58a69e0"
 
-TRAIN_DATA_PATH="/root/data/gsm8k/train.parquet"
-VAL_DATA_PATH="/root/data/gsm8k/test.parquet"
+TRAIN_DATA_PATH="/shared/user/bhe/data/verl/math/train.parquet"
+VAL_DATA_PATH="/shared/user/bhe/data/verl/math/test.parquet"
 TRAIN_PROMPT_FILES="['${TRAIN_DATA_PATH}']"
 VAL_PROMPT_FILES="['${VAL_DATA_PATH}']"
 
@@ -50,7 +52,7 @@ PARAM_OFFLOAD=False
 OPTIM_OFFLOAD=False
 MODEL_DTYPE="bf16"
 
-ROLLOUT_BACKEND="sglang"
+ROLLOUT_BACKEND="vllm"
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=2
 VLLM_TP_SIZE=2
 VLLM_GPU_MEM_UTIL=0.6
@@ -76,6 +78,7 @@ COMMAND="CUDA_VISIBLE_DEVICES=${VISIBLE_DEVICES} PYTHONUNBUFFERED=1 python3 -m $
     ++actor_rollout_ref.rollout.tensor_model_parallel_size=${VLLM_TP_SIZE} \
     ++actor_rollout_ref.rollout.gpu_memory_utilization=${VLLM_GPU_MEM_UTIL} \
     ++actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU} \
+    ++critic.model.path=\"${BASE_MODEL_PATH}\" \
     ++reward_model.model.path=\"${REWARD_MODEL_PATH}\" \
     ++reward_model.micro_batch_size_per_gpu=${RM_MICRO_BATCH_SIZE_PER_GPU} \
     ++algorithm.dpo_beta=${DPO_BETA} \

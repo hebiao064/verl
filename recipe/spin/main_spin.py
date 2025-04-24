@@ -54,7 +54,7 @@ def get_custom_reward_fn(config):
     return wrapped_fn
 
 
-@hydra.main(config_path='config', config_name='dpo_trainer', version_base=None)
+@hydra.main(config_path='config', config_name='spin_trainer', version_base=None)
 def main(config):
     run_ppo(config)
 
@@ -191,7 +191,6 @@ class TaskRunner:
                                 reward_fn=reward_fn,
                                 val_reward_fn=val_reward_fn)
         trainer.init_workers()
-        # trainer.fit()
         trainer.fit_dpo2()
 
 

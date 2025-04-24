@@ -40,9 +40,6 @@ from verl.utils.flops_counter import FlopsCounter
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
-import math
-from collections import defaultdict
-
 from codetiming import Timer
 
 logger = logging.getLogger(__file__)
@@ -384,9 +381,9 @@ class ActorRolloutRefWorker(Worker):
 
         use_remove_padding = self.config.model.get('use_remove_padding', False)
 
-        if self._is_actor or self._is_rollout:
+        if self._is_actor or self._is_rollout or self._is_ref:
             # we need the model for actor and rollout
-            if self._is_actor:
+            if self._is_actor or self._is_ref:
                 optim_config = self.config.actor.optim
                 fsdp_config = self.config.actor.fsdp_config
             else:
@@ -410,7 +407,7 @@ class ActorRolloutRefWorker(Worker):
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
         # load from checkpoint
-        if self._is_actor:
+        if self._is_actor or self._is_ref:
             OmegaConf.set_struct(self.config.actor, True)
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
@@ -436,6 +433,13 @@ class ActorRolloutRefWorker(Worker):
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+            self.checkpoint_manager = FSDPCheckpointManager(
+                model=self.actor_module_fsdp,
+                optimizer=self.actor.actor_optimizer,
+                lr_scheduler=self.actor_lr_scheduler,
+                processing_class=self.processor if self.processor is not None else self.tokenizer,
+                checkpoint_contents=self.config.actor.checkpoint.contents)
+
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -491,83 +495,75 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
         return output
-
+    
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor_dpo(self, data: DataProto):
-        """FSDP Wrapper for the Online DPO update step."""
-        if not self._is_actor:
-            raise RuntimeError("update_actor_dpo called on non-actor worker.")
-        # Ensure self.actor (the DataParallelPPOActor instance) exists
-        if not hasattr(self, 'actor') or self.actor is None:
-            raise RuntimeError("self.actor (DataParallelPPOActor) not initialized.")
-        if not hasattr(self.actor, 'update_actor_dpo'):
-             raise AttributeError("self.actor does not have the 'update_actor_dpo' method.")
-
-        # --- FSDP Setup ---
+        """
+        Wrapper for actor update step. Handles FSDP state management.
+        Calls self.actor.update_policy which now contains DPO logic based
+        on pre-calculated log probabilities.
+        """
+        # Support all hardwares
         data = data.to(torch.cuda.current_device())
+
+        assert self._is_actor # Make sure this worker has the actor role
+        if self.actor is None:
+             raise RuntimeError("Actor instance (self.actor) not initialized in worker.")
+
+        # --- FSDP State Management ---
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
-            # Ensure optimizer is associated with the *FSDP wrapped* module params
-            load_fsdp_optimizer(optimizer=self.actor.actor_optimizer, device_id=torch.cuda.current_device())
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
 
-        log_gpu_memory_usage('Before update policy DPO (FSDP)', logger=logger)
+        log_gpu_memory_usage('Before update policy (DPO via PPO path)', logger=logger)
 
-        # Set model modes (FSDP might handle this, but explicit is safer)
-        self.actor_module_fsdp.train()
-        has_separate_ref = hasattr(self, 'ref_module_fsdp') and self.ref_module_fsdp is not None and self.ref_module_fsdp is not self.actor_module_fsdp
-        if has_separate_ref:
-             if self._is_offload_param and self._is_ref:
-                 load_fsdp_model_to_gpu(self.ref_module_fsdp)
-             self.ref_module_fsdp.eval()
-
-
-        # --- Delegate to Core Logic ---
-        metrics = {}
-        # Use FSDP / Ulysses context managers if needed
+        # --- Ulysses Sharding (if used) ---
         with self.ulysses_sharding_manager:
-            # Preprocess data for sharding if Ulysses SP is used
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
 
-            metrics = self.actor.update_actor_dpo(data=data) # Pass the potentially sharded data
-            print(f"metrics: {metrics}")
-            # Postprocess metrics if needed after sharding
-            output = DataProto(meta_info={'metrics': metrics}) # Wrap metrics
+            # --- Call the core update method (now containing DPO logic) ---
+            with Timer(name='update_policy_dpo_via_ppo', logger=None) as timer: # Use a distinct timer name
+                # Calls the modified update_policy method
+                metrics = self.actor.update_policy_dpo_with_ref(data=data) # <-- THIS CALLS THE MODIFIED FUNCTION
+            delta_time = timer.last
+
+            # --- Add Performance Metrics ---
+            # MFU calculation might be less accurate/meaningful here for DPO
+            metrics['perf/approx_tokens_processed'] = torch.sum(data.batch.get('attention_mask', torch.tensor(0))).item() # Approx tokens
+            metrics['perf/max_memory_allocated_gb'] = torch.cuda.max_memory_allocated() / (1024**3)
+            metrics['perf/max_memory_reserved_gb'] = torch.cuda.max_memory_reserved() / (1024**3)
+            metrics['perf/cpu_memory_used_gb'] = psutil.virtual_memory().used / (1024**3)
+
+            # --- LR Scheduler Step ---
+            self.actor_lr_scheduler.step()
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics['actor/lr'] = lr
+
+            log_gpu_memory_usage('After update policy (DPO via PPO path)', logger=logger)
+
+            # --- Prepare Output ---
+            output = DataProto(meta_info={'metrics': metrics})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
-            metrics = output.meta_info['metrics'] # Extract potentially modified metrics
+            output = output.to('cpu')
 
-
-        log_gpu_memory_usage('After update policy DPO (FSDP)', logger=logger)
-
-        # --- FSDP Cleanup ---
+        # --- FSDP State Management (Offload) ---
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            if has_separate_ref:
-                 offload_fsdp_model_to_cpu(self.ref_module_fsdp)
         if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor.actor_optimizer)
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
-        # Return metrics wrapped in DataProto, moved to CPU
-        return DataProto(meta_info={'metrics': metrics}).to('cpu')
-    
+        return output
 
-   
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
-        print("---- DEBUG PROMPT BATCH SHAPES ----")
-        for k, v in prompts.batch.items():
-            print(f"{k}: {v.shape}, dtype={v.dtype}, max={v.max().item() if torch.is_floating_point(v) or v.dtype in [torch.int32, torch.int64] else 'N/A'}")
-        print("input_ids sample:", prompts.batch['input_ids'][0])
         prompts = prompts.to(torch.cuda.current_device())
-        # print(f"prompts: {prompts}")
-
 
         assert self._is_rollout
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        
-        print("test")
+
         meta_info = {
             'eos_token_id':
                 self.generation_config.eos_token_id
@@ -577,8 +573,6 @@ class ActorRolloutRefWorker(Worker):
                 if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        
-        print("test2")
         with self.rollout_sharding_manager:
 
             # after parameters sync with rollout, offload actor model to CPU
@@ -595,7 +589,6 @@ class ActorRolloutRefWorker(Worker):
 
             output = self.rollout_sharding_manager.postprocess_data(output)
 
-        print(f"output: {output}")
         output = output.to('cpu')
 
         # clear kv cache
@@ -1198,9 +1191,11 @@ class RewardModelWorker(Worker):
             max_length = self.config.get('max_length', src_max_length)
             if max_length is None:
                 max_length = src_max_length
-            input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
-                prompt=prompt_with_chat_template,
-                tokenizer=target_tokenizer,
+
+            model_inputs = target_tokenizer(prompt_with_chat_template, return_tensors='pt', add_special_tokens=False)
+            input_ids, attention_mask = verl_F.postprocess_data(
+                input_ids=model_inputs['input_ids'],
+                attention_mask=model_inputs['attention_mask'],
                 max_length=max_length,
                 pad_token_id=target_tokenizer.pad_token_id,
                 left_pad=False,  # right padding

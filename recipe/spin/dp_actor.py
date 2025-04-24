@@ -17,24 +17,25 @@ Single Process Actor
 
 import itertools
 from typing import Iterable, Tuple
-import math
+
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
-from verl.trainer.ppo.core_algos import compute_policy_loss, kl_penalty, agg_loss
-from recipe.spin.core_algos import compute_online_dpo_loss, get_batch_logps
+from recipe.spin.core_algos import compute_policy_loss, kl_penalty, agg_loss, compute_online_dpo_loss, get_batch_logps
 from verl.workers.actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
-
-from typing import Iterable, Tuple, Dict, Any
-
+import numpy as np
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+
+
+import math
+from collections import defaultdict
 
 __all__ = ['DataParallelPPOActor']
 
@@ -154,213 +155,12 @@ class DataParallelPPOActor(BasePPOActor):
                                            **multi_modal_inputs,
                                            use_cache=False)  # prevent model thinks we are generating
                 logits = output.logits
-                print(f"Reference Worker produced logits shape: {logits.shape}") # Add this line
-
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
                 entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
-            print(f"Reference Worker _forward_micro_batch returning log_probs shape: {log_probs.shape}") # Add this
 
             return entropy, log_probs
-    
-    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Calculates token-level entropy and log probabilities for a micro-batch.
-
-        Args:
-            micro_batch (dict): Dictionary containing tensors like 'input_ids',
-                                'attention_mask', 'position_ids', 'responses'.
-            temperature (float): Temperature for scaling logits.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - entropy: Token-level entropy. Shape: (batch_size, sequence_length - 1)
-                           Corresponds to entropy of predicting token t+1 given tokens up to t.
-                - log_probs: Token-level log probabilities. Shape: (batch_size, sequence_length - 1)
-                             Corresponds to log P(token t+1 | tokens up to t).
-        """
-        # response_length = micro_batch['responses'].size(-1) # Not needed for slicing anymore
-        multi_modal_inputs = {}
-        if 'multi_modal_inputs' in micro_batch:
-            for key in micro_batch['multi_modal_inputs'][0].keys():
-                multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch['multi_modal_inputs']],
-                                                    dim=0)
-
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            input_ids = micro_batch['input_ids']
-            batch_size, seqlen = input_ids.shape
-            print(f"[_forward_micro_batch] Input seqlen: {seqlen}") # Log input seqlen
-            attention_mask = micro_batch['attention_mask']
-            position_ids = micro_batch['position_ids']
-            if position_ids.dim() == 3:  # qwen2vl mrope
-                position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
-
-            # Prepare labels for log probability calculation (shift input_ids)
-            # Shape: (batch_size, sequence_length)
-            labels = torch.roll(input_ids, shifts=-1, dims=1)
-            labels[:, -1] = -100 # Or your label_pad_token_id
-
-            if self.use_remove_padding:
-                print("[_forward_micro_batch] Using rmpad path.") # Log path
-                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
-                                                           attention_mask)
-                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
-
-                if position_ids.dim() == 3:
-                    position_ids_rmpad = index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."),
-                                                          indices).transpose(0, 1).unsqueeze(1)
-                else:
-                    position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
-                                                          indices).transpose(0, 1)
-
-                labels_rmpad = index_first_axis(rearrange(labels.unsqueeze(-1), "b s ... -> (b s) ..."),
-                                                indices).transpose(0, 1)
-
-                if self.use_ulysses_sp:
-                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(input_ids_rmpad, \
-                                                                                                position_ids_rmpad, \
-                                                                                                sp_size=self.ulysses_sequence_parallel_size)
-                    labels_rmpad, _, _ = ulysses_pad_and_slice_inputs(labels_rmpad, None,
-                                                                      self.ulysses_sequence_parallel_size)
-
-                labels_rmpad_squeezed = labels_rmpad.squeeze(0)
-
-                # Forward pass
-                output = self.actor_module(input_ids=input_ids_rmpad,
-                                           attention_mask=None,
-                                           position_ids=position_ids_rmpad,
-                                           **multi_modal_inputs,
-                                           use_cache=False)
-                logits_rmpad = output.logits.squeeze(0)
-                print(f"[_forward_micro_batch] rmpad logits_rmpad shape: {logits_rmpad.shape}") # Log shape
-
-                logits_rmpad.div_(temperature)
-
-                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
-
-                # [* ADDED PRINT *] Log shapes before logprobs_from_logits
-                print(f"[_forward_micro_batch] rmpad calling logprobs_from_logits with logits shape: {logits_rmpad.shape}, labels shape: {labels_rmpad_squeezed.shape}")
-                log_probs_rmpad = logprobs_from_logits(logits=logits_rmpad, labels=labels_rmpad_squeezed)
-                # [* ADDED PRINT *] Log shape after logprobs_from_logits
-                print(f"[_forward_micro_batch] rmpad log_probs_rmpad shape: {log_probs_rmpad.shape}")
-
-
-                if self.use_ulysses_sp:
-                    log_probs_rmpad = gather_outpus_and_unpad(log_probs_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-                    entropy_rmpad = gather_outpus_and_unpad(entropy_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-                    print(f"[_forward_micro_batch] rmpad log_probs_rmpad shape after gather: {log_probs_rmpad.shape}") # Log shape
-
-                # [* ADDED PRINT *] Log shapes before pad_input
-                print(f"[_forward_micro_batch] rmpad calling pad_input with log_probs shape: {log_probs_rmpad.unsqueeze(-1).shape}, indices len: {len(indices)}, batch: {batch_size}, seqlen: {seqlen}")
-                full_log_probs = pad_input(hidden_states=log_probs_rmpad.unsqueeze(-1),
-                                           indices=indices,
-                                           batch=batch_size,
-                                           seqlen=seqlen) # Make sure seqlen is correct (e.g., 8192)
-                # [* ADDED PRINT *] Log shape after pad_input
-                print(f"[_forward_micro_batch] rmpad full_log_probs shape after pad_input: {full_log_probs.shape}")
-
-                full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
-                                         indices=indices,
-                                         batch=batch_size,
-                                         seqlen=seqlen)
-
-                log_probs = full_log_probs.squeeze(-1)[:, :-1]
-                entropy = full_entropy.squeeze(-1)[:, :-1]
-
-
-            else:  # not using rmpad and no ulysses sp
-                print("[_forward_micro_batch] Using non-rmpad path.") # Log path
-                # Forward pass
-                output = self.actor_module(input_ids=input_ids,
-                                           attention_mask=attention_mask,
-                                           position_ids=position_ids,
-                                           **multi_modal_inputs,
-                                           use_cache=False)
-                logits = output.logits
-                print(f"[_forward_micro_batch] non-rmpad logits shape: {logits.shape}") # Log shape
-
-                logits.div_(temperature)
-
-                shift_logits = logits[:, :-1, :]
-                shift_labels = labels[:, :-1]
-
-                # [* ADDED PRINT *] Log shapes before logprobs_from_logits
-                print(f"[_forward_micro_batch] non-rmpad calling logprobs_from_logits with logits shape: {shift_logits.shape}, labels shape: {shift_labels.shape}")
-                log_probs = logprobs_from_logits(shift_logits, shift_labels)
-                # [* ADDED PRINT *] Log shape after logprobs_from_logits
-                print(f"[_forward_micro_batch] non-rmpad log_probs shape: {log_probs.shape}")
-
-                entropy = verl_F.entropy_from_logits(shift_logits)
-
-        # [* ADDED PRINT *] Log final shape before returning
-        print(f"Reference Worker _forward_micro_batch returning log_probs shape: {log_probs.shape}")
-        return entropy, log_probs
-
-    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
-        """
-        Compute the TOKEN-LEVEL log probability for the full sequence.
-        This is used by the reference worker.
-
-        Args:
-            data (DataProto): Input data containing tensors like 'input_ids', 'attention_mask', etc.
-
-        Returns:
-            torch.Tensor: Token-level log probabilities for the sequence.
-                          Shape: (batch_size, sequence_length - 1)
-        """
-        # [* ADDED PRINT *] Identify when this specific function is called
-        print(f"DataParallelPPOActor: compute_log_prob called.")
-        # Add print statement for input shape verification
-        print(f"Reference Worker received input_ids shape: {data.batch['input_ids'].shape}")
-        self.actor_module.eval()
-
-        micro_batch_size = data.meta_info['micro_batch_size']
-        temperature = data.meta_info['temperature']
-        use_dynamic_bsz = data.meta_info['use_dynamic_bsz']
-
-        select_keys = ['input_ids', 'attention_mask', 'position_ids', 'responses'] # Include responses if needed by _forward_micro_batch, though it's unused after the fix
-        batch = data.select(batch_keys=select_keys).batch
-        has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
-
-        if has_multi_modal_inputs:
-            num_micro_batches = data.batch.batch_size[0] // micro_batch_size
-            non_tensor_select_keys = ['multi_modal_inputs']
-            micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
-        elif use_dynamic_bsz:
-            max_token_len = data.meta_info['max_token_len'] * self.ulysses_sequence_parallel_size
-            micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
-        else:
-            micro_batches = batch.split(micro_batch_size)
-
-        log_probs_lst = []
-        for micro_batch_proto in micro_batches:
-            if isinstance(micro_batch_proto, DataProto):
-                micro_batch_dict = {**micro_batch_proto.batch, **micro_batch_proto.non_tensor_batch}
-            else: # It's a TensorDict
-                 micro_batch_dict = micro_batch_proto.to_dict()
-
-
-            with torch.no_grad():
-                # _forward_micro_batch now returns full sequence token-level logprobs
-                _, log_probs_full_seq = self._forward_micro_batch(micro_batch_dict, temperature=temperature)
-                # Shape: (current_micro_batch_size, sequence_length - 1)
-            log_probs_lst.append(log_probs_full_seq)
-
-        # Concatenate results from all micro-batches
-        # Shape: (total_batch_size, sequence_length - 1)
-        log_probs_all = torch.concat(log_probs_lst, dim=0)
-
-        if use_dynamic_bsz:
-            indices = list(itertools.chain.from_iterable(indices))
-            assert len(indices) == log_probs_all.size(0), f"{len(indices)} vs. {log_probs_all.size()}"
-            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-            log_probs_all = log_probs_all[revert_indices]
-
-        # [* ADDED PRINT *] Log final shape returned by compute_log_prob
-        print(f"DataParallelPPOActor: compute_log_prob returning shape: {log_probs_all.shape}")
-        # Return the token-level log probabilities for the full sequence length (-1)
-        return log_probs_all
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -378,65 +178,63 @@ class DataParallelPPOActor(BasePPOActor):
             self.actor_optimizer.step()
         return grad_norm
 
-    # def compute_log_prob(self, data: DataProto) -> torch.Tensor:
-    #     """Compute the log probability of the responses given input_ids, attention_mask and position_ids
+    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
+        """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
-    #     Args:
-    #         data (DataProto): a DataProto containing keys
+        Args:
+            data (DataProto): a DataProto containing keys
 
-    #             ``input_ids``: tensor of shape [batch_size, sequence_length]. torch.int64. Note that input_ids is the
-    #             concatenation of prompt and response. Note that ``sequence_length = prompt_length + response_length``.
+                ``input_ids``: tensor of shape [batch_size, sequence_length]. torch.int64. Note that input_ids is the
+                concatenation of prompt and response. Note that ``sequence_length = prompt_length + response_length``.
 
-    #             ``attention_mask``: tensor of shape [batch_size, sequence_length]. torch.int64.
+                ``attention_mask``: tensor of shape [batch_size, sequence_length]. torch.int64.
 
-    #             ``position_ids``: tensor of shape [batch_size, sequence_length]. torch.int64.
+                ``position_ids``: tensor of shape [batch_size, sequence_length]. torch.int64.
 
-    #             ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
+                ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
 
-    #     Returns:
-    #         torch.Tensor: the log_prob tensor
-    #     """
-    #     # set to eval
-    #     print(f"Reference Worker received input_ids shape: {data.batch['input_ids'].shape}") # Add this line
+        Returns:
+            torch.Tensor: the log_prob tensor
+        """
+        # set to eval
+        self.actor_module.eval()
 
-    #     self.actor_module.eval()
+        micro_batch_size = data.meta_info['micro_batch_size']
+        temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
+        use_dynamic_bsz = data.meta_info['use_dynamic_bsz']
 
-    #     micro_batch_size = data.meta_info['micro_batch_size']
-    #     temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
-    #     use_dynamic_bsz = data.meta_info['use_dynamic_bsz']
+        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids']
+        batch = data.select(batch_keys=select_keys).batch
+        has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
 
-    #     select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids']
-    #     batch = data.select(batch_keys=select_keys).batch
-    #     has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
+        if has_multi_modal_inputs:
+            num_micro_batches = data.batch.batch_size[0] // micro_batch_size
+            non_tensor_select_keys = ['multi_modal_inputs']
+            micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+        elif use_dynamic_bsz:
+            # split using dynamic bsz
+            max_token_len = data.meta_info['max_token_len'] * self.ulysses_sequence_parallel_size
+            micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+        else:
+            micro_batches = batch.split(micro_batch_size)
 
-    #     if has_multi_modal_inputs:
-    #         num_micro_batches = data.batch.batch_size[0] // micro_batch_size
-    #         non_tensor_select_keys = ['multi_modal_inputs']
-    #         micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
-    #     elif use_dynamic_bsz:
-    #         # split using dynamic bsz
-    #         max_token_len = data.meta_info['max_token_len'] * self.ulysses_sequence_parallel_size
-    #         micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
-    #     else:
-    #         micro_batches = batch.split(micro_batch_size)
+        log_probs_lst = []
+        for micro_batch in micro_batches:
+            if isinstance(micro_batch, DataProto):
+                micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
 
-    #     log_probs_lst = []
-    #     for micro_batch in micro_batches:
-    #         if isinstance(micro_batch, DataProto):
-    #             micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            with torch.no_grad():
+                _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
+            log_probs_lst.append(log_probs)
+        log_probs = torch.concat(log_probs_lst, dim=0)
 
-    #         with torch.no_grad():
-    #             _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
-    #         log_probs_lst.append(log_probs)
-    #     log_probs = torch.concat(log_probs_lst, dim=0)
+        if use_dynamic_bsz:
+            indices = list(itertools.chain.from_iterable(indices))
+            assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
+            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+            log_probs = log_probs[revert_indices]
 
-    #     if use_dynamic_bsz:
-    #         indices = list(itertools.chain.from_iterable(indices))
-    #         assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
-    #         revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-    #         log_probs = log_probs[revert_indices]
-
-    #     return log_probs
+        return log_probs
 
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
@@ -552,192 +350,337 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.zero_grad()
         return metrics
     
-    def update_actor_dpo(self, data: DataProto):
-        """Performs the Online DPO update step with improved reference logprob handling."""
-        if self.actor_optimizer is None:
-            raise RuntimeError("Optimizer not provided to DataParallelPPOActor for DPO update.")
-        
-        self.actor_module.train()
+    def update_policy_dpo(self, data: DataProto):
+        """
+        Performs the DPO update step using the provided chosen/rejected data.
+        Calculates log probs based on the CURRENT model state (ActorAsRef).
+        """
+        self.actor_module.train() # Ensure training mode
 
-        # Extract DPO parameters
-        beta = data.meta_info.get('dpo_beta', 0.1)
-        loss_type = data.meta_info.get('dpo_loss_type', 'sigmoid')
-        label_smoothing = 0
-        use_reference_policy_flag = data.meta_info.get('use_reference_policy', True)
+        # --- Retrieve necessary data ---
+        try:
+            # Expects batch prepared by fit_online_dpo loop
+            batch_td = data.batch
+            chosen_labels = batch_td['chosen_labels']
+            rejected_labels = batch_td['rejected_labels']
+            # ... other needed tensors like chosen/rejected input_ids, attention_mask, position_ids ...
 
+            # Get DPO params from meta_info
+            beta = data.meta_info.get('dpo_beta', 10)
+            loss_type = data.meta_info.get('dpo_loss_type', 'sigmoid')
+            label_smoothing = data.meta_info.get('dpo_label_smoothing', 0.0)
+            # Note: reference_free should be True when calling compute_online_dpo_loss in ActorAsRef
+            reference_free = data.meta_info.get('reference_free', True)
+
+        except KeyError as e:
+            print(f"ERROR: Missing required key for DPO update (in update_policy_dpo): {e}")
+            return {} # Return empty metrics on error
+        except Exception as e_data:
+            print(f"ERROR accessing data for DPO update (in update_policy_dpo): {e_data}")
+            return {}
+
+        # --- Micro-batching Setup (Similar to PPO update_policy) ---
         micro_batch_size = self.config.get('ppo_micro_batch_size_per_gpu')
-        if micro_batch_size is None: 
-            raise ValueError("config 'actor.ppo_micro_batch_size_per_gpu' must be set")
-
-        batch_tensors = data.batch
-        non_tensor_batch_data = data.non_tensor_batch
-
-        try: 
-            total_batch_size = batch_tensors['chosen_input_ids'].shape[0]
-        except KeyError: 
-            print("ERROR: 'chosen_input_ids' missing.")
-            return {'metrics': {}}
-        if total_batch_size == 0: 
-            print("Warning: Empty batch.")
-            return {'metrics': {}}
-
-        num_micro_batches = math.ceil(total_batch_size / micro_batch_size)
+        if micro_batch_size is None:
+            raise ValueError("Config 'ppo_micro_batch_size_per_gpu' must be set.")
+        bsz = batch_td['chosen_input_ids'].shape[0]
+        num_micro_batches = math.ceil(bsz / micro_batch_size)
         gradient_accumulation_steps = num_micro_batches
 
+        # --- Metrics Accumulation ---
         total_loss = 0.0
-        total_chosen_rewards = 0.0
-        total_rejected_rewards = 0.0
-        total_logprob_diff = 0.0
-        num_pairs = 0
-        metrics = {}
+        accumulated_metrics = defaultdict(list)
+        metrics = {} # Final metrics dict
 
-        self.actor_optimizer.zero_grad()
+        # --- Zero Gradients ---
+        self.actor_optimizer.zero_grad(set_to_none=True)
 
+        # --- Micro-batch Loop ---
         for i in range(num_micro_batches):
             start_idx = i * micro_batch_size
-            end_idx = min(start_idx + micro_batch_size, total_batch_size)
-            current_micro_batch_size = end_idx - start_idx
+            end_idx = min(start_idx + micro_batch_size, bsz)
+            if start_idx >= end_idx: continue
 
-            micro_batch_tensors = {key: tensor[start_idx:end_idx] for key, tensor in batch_tensors.items()}
-            # Handle non-tensor slicing if needed
-            micro_batch_non_tensor = {}  # Populate if needed
+            # Slice the full DPO batch into micro-batches
+            micro_batch_td = batch_td[start_idx:end_idx]
 
-            autocast_dtype = torch.bfloat16  # Default
-            fsdp_cfg = self.config.get('fsdp_config', {})
-            if fsdp_cfg and fsdp_cfg.get('mixed_precision'):
-                param_dtype_str = fsdp_cfg.mixed_precision.get('param_dtype', 'bf16')
-                autocast_dtype = verl_F.PrecisionType.to_dtype(param_dtype_str)
+            # Determine autocast dtype (copy from your working update_policy/update_actor)
+            autocast_dtype = torch.bfloat16 # Default
+            # ... (logic to get dtype from FSDP config) ...
 
+            # --- Autocast Forward Pass ---
             with torch.autocast(device_type='cuda', dtype=autocast_dtype):
-                # --- Policy Forward & Logprobs ---
-                chosen_mm_inputs = micro_batch_non_tensor.get('chosen_multi_modal_inputs', {})
-                rejected_mm_inputs = micro_batch_non_tensor.get('rejected_multi_modal_inputs', {})
-                
-                # Policy outputs for chosen responses
-                policy_chosen_outputs = self.actor_module(
-                    input_ids=micro_batch_tensors['chosen_input_ids'], 
-                    attention_mask=micro_batch_tensors['chosen_attention_mask'],
-                    position_ids=micro_batch_tensors.get('chosen_position_ids'), 
-                    **chosen_mm_inputs, 
-                    use_cache=False)
-                
-                # Policy outputs for rejected responses
-                policy_rejected_outputs = self.actor_module(
-                    input_ids=micro_batch_tensors['rejected_input_ids'], 
-                    attention_mask=micro_batch_tensors['rejected_attention_mask'],
-                    position_ids=micro_batch_tensors.get('rejected_position_ids'), 
-                    **rejected_mm_inputs, 
-                    use_cache=False)
-                
-                # Get sequence-level logprobs for policy model
+                # --- Step 1: Forward pass for CURRENT policy log probs (with grad) ---
+                chosen_inputs = {
+                    'input_ids': micro_batch_td['chosen_input_ids'],
+                    'attention_mask': micro_batch_td['chosen_attention_mask']
+                }
+                if 'chosen_position_ids' in micro_batch_td: chosen_inputs['position_ids'] = micro_batch_td['chosen_position_ids']
+                # This forward pass uses CURRENT parameters theta and tracks gradients
+                policy_chosen_outputs = self.actor_module(**chosen_inputs, use_cache=False)
+
+                rejected_inputs = {
+                    'input_ids': micro_batch_td['rejected_input_ids'],
+                    'attention_mask': micro_batch_td['rejected_attention_mask']
+                }
+                if 'rejected_position_ids' in micro_batch_td: rejected_inputs['position_ids'] = micro_batch_td['rejected_position_ids']
+                # This forward pass also uses CURRENT theta and tracks gradients
+                policy_rejected_outputs = self.actor_module(**rejected_inputs, use_cache=False)
+
+                # --- Step 2: Calculate CURRENT policy log probs using get_batch_logps ---
+                # These tensors WILL require grad w.r.t theta
                 policy_chosen_logps = get_batch_logps(
-                    policy_chosen_outputs.logits, 
-                    micro_batch_tensors['chosen_labels'], 
-                    average_log_prob=False)
-                
+                    policy_chosen_outputs.logits, micro_batch_td['chosen_labels'], average_log_prob=False
+                )
                 policy_rejected_logps = get_batch_logps(
-                    policy_rejected_outputs.logits, 
-                    micro_batch_tensors['rejected_labels'], 
-                    average_log_prob=False)
-
-                # --- Handle Reference Log Probs ---
-                # Get reference logprobs from batch
-                if 'reference_chosen_logps' in micro_batch_tensors and 'reference_rejected_logps' in micro_batch_tensors:
-                    reference_chosen_logps_token_level = micro_batch_tensors['reference_chosen_logps']
-                    reference_rejected_logps_token_level = micro_batch_tensors['reference_rejected_logps']
-                    
-                    # IMPROVED HANDLING: Convert token-level to sequence-level logprobs consistently
-                    if reference_chosen_logps_token_level.ndim > 1:  # It's token-level
-                        chosen_tokens_mask = (micro_batch_tensors['chosen_labels'] != -100)[:, 1:].to(reference_chosen_logps_token_level.dtype)
-                        
-                        # Ensure compatible shapes for masking
-                        if reference_chosen_logps_token_level.shape[1] != chosen_tokens_mask.shape[1]:
-                            # Trim to smaller size
-                            min_len = min(reference_chosen_logps_token_level.shape[1], chosen_tokens_mask.shape[1])
-                            reference_chosen_logps = (reference_chosen_logps_token_level[:, :min_len] * 
-                                                    chosen_tokens_mask[:, :min_len]).sum(dim=1)
-                        else:
-                            reference_chosen_logps = (reference_chosen_logps_token_level * chosen_tokens_mask).sum(dim=1)
-                    else:
-                        # Already sequence-level
-                        reference_chosen_logps = reference_chosen_logps_token_level
-                    
-                    # Same for rejected
-                    if reference_rejected_logps_token_level.ndim > 1:
-                        rejected_tokens_mask = (micro_batch_tensors['rejected_labels'] != -100)[:, 1:].to(reference_rejected_logps_token_level.dtype)
-                        
-                        if reference_rejected_logps_token_level.shape[1] != rejected_tokens_mask.shape[1]:
-                            min_len = min(reference_rejected_logps_token_level.shape[1], rejected_tokens_mask.shape[1])
-                            reference_rejected_logps = (reference_rejected_logps_token_level[:, :min_len] * 
-                                                    rejected_tokens_mask[:, :min_len]).sum(dim=1)
-                        else:
-                            reference_rejected_logps = (reference_rejected_logps_token_level * rejected_tokens_mask).sum(dim=1)
-                    else:
-                        reference_rejected_logps = reference_rejected_logps_token_level
-                else:
-                    # No reference logprobs provided, use zeros (reference-free mode)
-                    reference_chosen_logps = torch.zeros_like(policy_chosen_logps)
-                    reference_rejected_logps = torch.zeros_like(policy_rejected_logps)
-                    use_reference_policy_flag = False  # Force reference-free mode
-                
-                # Add debugging information
-                print(f"[DPO Debug] Reference chosen logprobs shape: {reference_chosen_logps.shape}")
-                print(f"[DPO Debug] Reference rejected logprobs shape: {reference_rejected_logps.shape}")
-                print(f"[DPO Debug] Policy chosen logprobs shape: {policy_chosen_logps.shape}")
-                print(f"[DPO Debug] Policy rejected logprobs shape: {policy_rejected_logps.shape}")
-                print(f"[DPO Debug] Mean ref logprob diff: {(reference_chosen_logps - reference_rejected_logps).mean().item():.4f}")
-                print(f"[DPO Debug] Mean policy logprob diff: {(policy_chosen_logps - policy_rejected_logps).mean().item():.4f}")
-
-                # --- Compute DPO Loss ---
-                loss = compute_online_dpo_loss(
-                    policy_chosen_logps, 
-                    policy_rejected_logps,
-                    reference_chosen_logps, 
-                    reference_rejected_logps,
-                    beta, 
-                    label_smoothing, 
-                    loss_type,
-                    reference_free=(not use_reference_policy_flag)
+                    policy_rejected_outputs.logits, micro_batch_td['rejected_labels'], average_log_prob=False
                 )
 
+                # --- Step 3: Calculate reference log probs (ActorAsRef - no grad) ---
+                with torch.no_grad():
+                    # Use the SAME logits from above, but detached from grad graph
+                    reference_chosen_logps = get_batch_logps(
+                        policy_chosen_outputs.logits.detach(), micro_batch_td['chosen_labels'], average_log_prob=False
+                    )
+                    reference_rejected_logps = get_batch_logps(
+                        policy_rejected_outputs.logits.detach(), micro_batch_td['rejected_labels'], average_log_prob=False
+                    )
+
+                # --- Step 4: Calculate DPO Logits and Loss ---
+                pi_logratios = policy_chosen_logps - policy_rejected_logps
+                # ref_logratios is calculated using detached logits, so it doesn't contribute to gradient w.r.t theta
+                ref_logratios = reference_chosen_logps - reference_rejected_logps
+                logits = pi_logratios - ref_logratios # DPO logits
+
+                loss = compute_online_dpo_loss(
+                    policy_chosen_logps=policy_chosen_logps, # Has grad
+                    policy_rejected_logps=policy_rejected_logps, # Has grad
+                    reference_chosen_logps=reference_chosen_logps, # No grad
+                    reference_rejected_logps=reference_rejected_logps, # No grad
+                    beta=beta,
+                    label_smoothing=label_smoothing,
+                    loss_type=loss_type,
+                    reference_free=reference_free # Should be True for ActorAsRef
+                )
+                # The loss tensor now depends on policy_chosen_logps and policy_rejected_logps,
+                # which depend on the forward passes that require grad.
+
+                # --- Scale loss for gradient accumulation ---
                 scaled_loss = loss / gradient_accumulation_steps
 
                 # --- Accumulate Metrics ---
-                total_loss += loss.item()
-                num_pairs += current_micro_batch_size
-                
-                with torch.no_grad():
-                    # Calculate reward metrics
-                    chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps)
-                    rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps)
-                    
-                    total_chosen_rewards += chosen_rewards.sum().item()
-                    total_rejected_rewards += rejected_rewards.sum().item()
-                    
-                    pi_logratios = policy_chosen_logps - policy_rejected_logps
-                    ref_logratios = reference_chosen_logps - reference_rejected_logps
-                    logits = pi_logratios - ref_logratios
-                    total_logprob_diff += logits.sum().item()
+                total_loss += loss.item() # Unscaled loss
+                # ... (accumulate other metrics like logits, logprobs etc. into accumulated_metrics dict) ...
+                accumulated_metrics['actor/dpo_loss_batch'].append(loss.item())
+                accumulated_metrics['actor/dpo_logits_batch'].append(logits.mean().item())
 
-            # --- Backward Pass ---
+
+            # --- Backward Pass (outside autocast) ---
+            # Calculates gradients based on the dependency: scaled_loss -> policy logps -> logits -> model params
             scaled_loss.backward()
 
-        # --- Optimizer Step ---
+        # --- End Micro-batch Loop ---
+
+        # --- Optimizer Step (after accumulating gradients for all micro-batches) ---
+        grad_norm = self._optimizer_step() # Applies update using accumulated gradients
+
+        # --- Populate Final Metrics ---
+        if bsz > 0: # Check if any pairs were processed
+            metrics['actor/dpo_loss'] = total_loss / num_micro_batches
+            metrics['actor/grad_norm'] = grad_norm.item() if torch.is_tensor(grad_norm) and torch.isfinite(grad_norm) else float('inf')
+            # ... (average other accumulated metrics) ...
+            for key, val_list in accumulated_metrics.items():
+                if val_list: metrics[key.replace('_batch','')] = np.mean(val_list)
+            # ... (calculate final reward/margin metrics based on averaged logprobs) ...
+        else:
+            metrics['actor/dpo_loss'] = 0.0; metrics['actor/grad_norm'] = 0.0
+
+        return metrics # Return aggregated metrics
+    
+    # Inside DataParallelPPOActor class in dpo2/dp_actor.py
+
+    def update_policy_dpo_with_ref(self, data: DataProto):
+        """
+        Performs the DPO update step using pre-calculated reference log probs
+        from an external, periodically updated reference model.
+        """
+        self.actor_module.train() # Ensure training mode
+
+        # --- Retrieve necessary data ---
+        try:
+            # Expects batch prepared by fit_dpo loop, including reference log probs
+            batch_td = data.batch
+            chosen_labels = batch_td['chosen_labels']
+            rejected_labels = batch_td['rejected_labels']
+            # ... other needed tensors like chosen/rejected input_ids, attention_mask, position_ids ...
+
+            # === Get PRE-CALCULATED reference log probs from input data ===
+            reference_chosen_logps = batch_td['reference_chosen_logps'] # Should be sequence-level logps
+            reference_rejected_logps = batch_td['reference_rejected_logps'] # Should be sequence-level logps
+            # ============================================================
+
+            # Get DPO params from meta_info
+            beta = data.meta_info.get('dpo_beta', 0.1) # Default beta
+            loss_type = data.meta_info.get('dpo_loss_type', 'sigmoid')
+            label_smoothing = data.meta_info.get('dpo_label_smoothing', 0.0)
+            # reference_free should now be False as we provide ref logps
+            reference_free = data.meta_info.get('reference_free', False) # Default False
+
+        except KeyError as e:
+            print(f"ERROR: Missing required key for DPO update (in update_policy_dpo): {e}")
+            print(f"Available keys in data.batch: {list(batch_td.keys())}") # Debug print
+            return {} # Return empty metrics on error
+        except Exception as e_data:
+            print(f"ERROR accessing data for DPO update (in update_policy_dpo): {e_data}")
+            return {}
+
+        # --- Micro-batching Setup ---
+        micro_batch_size = self.config.get('ppo_micro_batch_size_per_gpu')
+        if micro_batch_size is None:
+            # Fallback or default if not set, or raise error
+            micro_batch_size = 1 # Example fallback, adjust as needed
+            print(f"Warning: 'ppo_micro_batch_size_per_gpu' not set, defaulting to {micro_batch_size}")
+            # raise ValueError("Config 'ppo_micro_batch_size_per_gpu' must be set.")
+
+        # Ensure chosen_input_ids exists before getting shape
+        if 'chosen_input_ids' not in batch_td:
+             print("ERROR: 'chosen_input_ids' not found in batch_td for DPO update.")
+             return {}
+        bsz = batch_td['chosen_input_ids'].shape[0]
+
+        if bsz == 0:
+            print("Warning: DPO batch size is 0 in update_policy_dpo. Skipping update.")
+            return {'actor/dpo_loss': 0.0, 'actor/grad_norm': 0.0} # Return zero metrics if batch is empty
+
+        num_micro_batches = math.ceil(bsz / micro_batch_size)
+        gradient_accumulation_steps = num_micro_batches
+
+        # --- Metrics Accumulation ---
+        total_loss = 0.0
+        accumulated_metrics = defaultdict(list)
+        metrics = {} # Final metrics dict
+
+        # --- Zero Gradients ---
+        self.actor_optimizer.zero_grad(set_to_none=True)
+
+        # --- Micro-batch Loop ---
+        for i in range(num_micro_batches):
+            start_idx = i * micro_batch_size
+            end_idx = min(start_idx + micro_batch_size, bsz)
+            if start_idx >= end_idx: continue
+
+            # Slice the full DPO batch into micro-batches
+            # Important: Slice ALL required tensors, including labels and inputs
+            micro_batch_chosen_labels = chosen_labels[start_idx:end_idx]
+            micro_batch_rejected_labels = rejected_labels[start_idx:end_idx]
+            micro_batch_chosen_inputs = {
+                'input_ids': batch_td['chosen_input_ids'][start_idx:end_idx],
+                'attention_mask': batch_td['chosen_attention_mask'][start_idx:end_idx]
+            }
+            if 'chosen_position_ids' in batch_td:
+                micro_batch_chosen_inputs['position_ids'] = batch_td['chosen_position_ids'][start_idx:end_idx]
+
+            micro_batch_rejected_inputs = {
+                'input_ids': batch_td['rejected_input_ids'][start_idx:end_idx],
+                'attention_mask': batch_td['rejected_attention_mask'][start_idx:end_idx]
+            }
+            if 'rejected_position_ids' in batch_td:
+                micro_batch_rejected_inputs['position_ids'] = batch_td['rejected_position_ids'][start_idx:end_idx]
+
+
+            # Determine autocast dtype
+            autocast_dtype = torch.bfloat16 # Or get dynamically from config/FSDP settings
+            # --- Autocast Forward Pass ---
+            with torch.autocast(device_type='cuda', dtype=autocast_dtype):
+                # --- Step 1: Forward pass for CURRENT policy log probs (with grad) ---
+                policy_chosen_outputs = self.actor_module(**micro_batch_chosen_inputs, use_cache=False)
+                policy_rejected_outputs = self.actor_module(**micro_batch_rejected_inputs, use_cache=False)
+
+                # --- Step 2: Calculate CURRENT policy log probs using get_batch_logps ---
+                policy_chosen_logps = get_batch_logps(
+                    policy_chosen_outputs.logits, micro_batch_chosen_labels, average_log_prob=False
+                )
+                policy_rejected_logps = get_batch_logps(
+                    policy_rejected_outputs.logits, micro_batch_rejected_labels, average_log_prob=False
+                )
+
+                # --- Step 3: Retrieve PRE-CALCULATED reference log probs (NO grad needed) ---
+                # Slice the full batch reference logps for the current micro-batch
+                micro_ref_chosen_logps = reference_chosen_logps[start_idx:end_idx]
+                micro_ref_rejected_logps = reference_rejected_logps[start_idx:end_idx]
+                # --- The ActorAsRef calculation block is REMOVED ---
+
+                # --- Step 4: Calculate DPO Logits and Loss ---
+                pi_logratios = policy_chosen_logps - policy_rejected_logps
+                ref_logratios = micro_ref_chosen_logps - micro_ref_rejected_logps # Uses pre-calculated values
+                logits = pi_logratios - ref_logratios # DPO logits
+
+                loss = compute_online_dpo_loss(
+                    policy_chosen_logps=policy_chosen_logps,         # Has grad
+                    policy_rejected_logps=policy_rejected_logps,       # Has grad
+                    reference_chosen_logps=micro_ref_chosen_logps,   # No grad (from input)
+                    reference_rejected_logps=micro_ref_rejected_logps, # No grad (from input)
+                    beta=beta,
+                    label_smoothing=label_smoothing,
+                    loss_type=loss_type,
+                    reference_free=reference_free # Should be False now
+                )
+
+                # --- Scale loss for gradient accumulation ---
+                scaled_loss = loss / gradient_accumulation_steps
+
+                # --- Accumulate Metrics ---
+                total_loss += loss.item() # Unscaled loss
+                accumulated_metrics['actor/dpo_loss_batch'].append(loss.item())
+                accumulated_metrics['actor/dpo_logits_batch'].append(logits.mean().item())
+                # Accumulate policy and reference log probs/ratios if needed for debugging
+                accumulated_metrics['actor/policy_chosen_logps_batch'].append(policy_chosen_logps.mean().item())
+                accumulated_metrics['actor/policy_rejected_logps_batch'].append(policy_rejected_logps.mean().item())
+                accumulated_metrics['actor/reference_chosen_logps_batch'].append(micro_ref_chosen_logps.mean().item())
+                accumulated_metrics['actor/reference_rejected_logps_batch'].append(micro_ref_rejected_logps.mean().item())
+
+            # --- Backward Pass (outside autocast) ---
+            # Check if loss requires grad before backward
+            if scaled_loss.requires_grad:
+                scaled_loss.backward()
+            else:
+                print(f"Warning: Scaled loss at micro-batch {i} does not require grad. Skipping backward.")
+
+
+        # --- End Micro-batch Loop ---
+
+        # --- Optimizer Step (after accumulating gradients for all micro-batches) ---
         grad_norm = self._optimizer_step()
 
         # --- Populate Final Metrics ---
-        if num_pairs > 0:
+        if num_micro_batches > 0 and bsz > 0: # Check if any processing happened
             metrics['actor/dpo_loss'] = total_loss / num_micro_batches
-            metrics['actor/grad_norm'] = grad_norm.item() if torch.isfinite(grad_norm) else float('inf')
-            metrics['actor/rewards_chosen'] = total_chosen_rewards / num_pairs
-            metrics['actor/rewards_rejected'] = total_rejected_rewards / num_pairs
-            metrics['actor/rewards_accuracies'] = (total_chosen_rewards > total_rejected_rewards).float().mean().item() if torch.is_tensor(total_chosen_rewards) else float(total_chosen_rewards > total_rejected_rewards)
-            metrics['actor/rewards_margins'] = (total_chosen_rewards - total_rejected_rewards) / num_pairs
-            metrics['actor/logits'] = total_logprob_diff / num_pairs
-        else: 
-            metrics['actor/dpo_loss'] = 0.0
-            metrics['actor/grad_norm'] = 0.0
+            metrics['actor/grad_norm'] = grad_norm.item() if torch.is_tensor(grad_norm) and torch.isfinite(grad_norm) else float('inf')
+            # Average other accumulated metrics
+            for key, val_list in accumulated_metrics.items():
+                if val_list: metrics[key.replace('_batch','')] = np.mean(val_list)
 
-        # Zero gradients to prevent accumulation across batches
-        self.actor_optimizer.zero_grad(set_to_none=True)
-        return metrics
+            # Calculate accuracy / rewards / margins based on averaged logprobs if desired
+            if 'actor/policy_chosen_logps' in metrics and 'actor/policy_rejected_logps' in metrics and \
+               'actor/reference_chosen_logps' in metrics and 'actor/reference_rejected_logps' in metrics:
+                policy_ratio_mean = metrics['actor/policy_chosen_logps'] - metrics['actor/policy_rejected_logps']
+                ref_ratio_mean = metrics['actor/reference_chosen_logps'] - metrics['actor/reference_rejected_logps']
+                logits_mean = policy_ratio_mean - ref_ratio_mean
+                metrics['actor/rewards_chosen'] = beta * (metrics['actor/policy_chosen_logps'] - metrics['actor/reference_chosen_logps'])
+                metrics['actor/rewards_rejected'] = beta * (metrics['actor/policy_rejected_logps'] - metrics['actor/reference_rejected_logps'])
+                metrics['actor/rewards_accuracies'] = float(logits_mean > 0) # Mean accuracy proxy
+                metrics['actor/rewards_margins'] = metrics['actor/rewards_chosen'] - metrics['actor/rewards_rejected']
+
+        else: # Handle case where no micro-batches were run (e.g., bsz=0)
+             metrics['actor/dpo_loss'] = 0.0
+             metrics['actor/grad_norm'] = 0.0
+             # Initialize other metrics to 0 or NaN as appropriate
+             for key in accumulated_metrics.keys():
+                 metrics[key.replace('_batch','')] = 0.0
+             metrics['actor/rewards_chosen'] = 0.0
+             metrics['actor/rewards_rejected'] = 0.0
+             metrics['actor/rewards_accuracies'] = 0.0
+             metrics['actor/rewards_margins'] = 0.0
+
+
+        return metrics # Return aggregated metrics
